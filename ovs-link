@@ -23,8 +23,8 @@ ovs_vsctl () {
 
 create_netns_link () {
     mkdir -p /var/run/netns
-    if [ ! -e /var/run/netns/"$PID" ]; then
-        ln -s /proc/"$PID"/ns/net /var/run/netns/"$PID"
+    if [ ! -e /var/run/netns/"$CONTAINER" ]; then
+        ln -s /proc/"$CONTAINER"/ns/net /var/run/netns/"$CONTAINER"
         trap 'delete_netns_link' 0
         for signal in 1 2 3 13 14 15; do
             trap 'delete_netns_link; trap - $signal; kill -$signal $$' $signal
@@ -33,7 +33,7 @@ create_netns_link () {
 }
 
 delete_netns_link () {
-    rm -f /var/run/netns/"$PID"
+    rm -f /var/run/netns/"$CONTAINER"
 }
 
 get_port_for_container_interface () {
@@ -257,16 +257,16 @@ add_port () {
         exit 1
     fi
     
-    if PID=`get_pid "$RUNTIME" "$CONTAINER" "$USER"`;then :; else
-      exit 1
-    fi
-    
     if [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
+      
+      if CONTAINER=`get_pid "$RUNTIME" "$CONTAINER" "$USER"`;then :; else
+        exit 1
+      fi
       
       create_netns_link
       
       # chack if interface exists inside the container
-      if ip netns exec "$PID" ip link | grep "$INTERFACE" >/dev/null;then
+      if ip netns exec "$CONTAINER" ip link | grep "$INTERFACE" >/dev/null;then
         echo >&2 "$UTIL: INTERFACE=$INTERFACE exists in CONTAINER=$CONTAINER"
         exit 1
       fi
@@ -290,9 +290,9 @@ add_port () {
       ip link set "${PORTNAME}_l" up
 
       # Move "${PORTNAME}_c" inside the container and changes its name.
-      ip link set "${PORTNAME}_c" netns "$PID"
-      ip netns exec "$PID" ip link set dev "${PORTNAME}_c" name "$INTERFACE"
-      ip netns exec "$PID" ip link set "$INTERFACE" up
+      ip link set "${PORTNAME}_c" netns "$CONTAINER"
+      ip netns exec "$CONTAINER" ip link set dev "${PORTNAME}_c" name "$INTERFACE"
+      ip netns exec "$CONTAINER" ip link set "$INTERFACE" up
     
     else
       
@@ -338,7 +338,7 @@ add_port () {
             exit 1
         fi
       elif [ "$RUNTIME" = "runc"  -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc"  ]; then
-        ip netns exec "$PID" ip link set dev "$INTERFACE" mtu "$MTU"
+        ip netns exec "$CONTAINER" ip link set dev "$INTERFACE" mtu "$MTU"
       fi
       
     fi
@@ -354,7 +354,7 @@ add_port () {
         docker exec $CONTAINER ip addr add "$ADDRESS" dev "$INTERFACE"
         
       elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
-        ip netns exec "$PID" ip addr add "$ADDRESS" dev "$INTERFACE"
+        ip netns exec "$CONTAINER" ip addr add "$ADDRESS" dev "$INTERFACE"
       fi
       
     fi
@@ -368,7 +368,7 @@ add_port () {
             exit 1
         fi
       elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
-        ip netns exec "$PID" ip link set dev "$INTERFACE" address "$MACADDRESS"
+        ip netns exec "$CONTAINER" ip link set dev "$INTERFACE" address "$MACADDRESS"
       fi
       
     fi
@@ -387,8 +387,8 @@ add_port () {
             exit 1
         fi
       elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
-        ip netns exec "$PID" ip route delete default
-        ip netns exec "$PID" ip route add default via "$GATEWAY"
+        ip netns exec "$CONTAINER" ip route delete default
+        ip netns exec "$CONTAINER" ip route add default via "$GATEWAY"
       fi
       
     fi
@@ -489,15 +489,8 @@ add_port () {
     fi
     
     if [ -n "$ARPGUARD" -o -n "$IPGUARD" ]; then
-      
-      if [ "$RUNTIME" = "kata-runtime" ]; then
         MAC=`get_mac_address $RUNTIME $CONTAINER $INTERFACE`
         IP=`get_ip_address $RUNTIME $CONTAINER $INTERFACE`
-      elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
-        MAC=`get_mac_address $RUNTIME $PID $INTERFACE`
-        IP=`get_ip_address $RUNTIME $PID $INTERFACE`
-      fi
-
     fi
     
     if [ -n "$ARPGUARD" ]; then
@@ -663,6 +656,10 @@ Commands:
                     ${UTIL} add-port br-int eth1 c474a0e2830e
                     --ipaddress=192.168.1.2/24 --gateway=192.168.1.1
                     --macaddress="a2:c3:0d:49:7f:f8" --mtu=1450
+  set-port BRIDGE INTERFACE CONTAINER [--user=USER] [--ipaddress="ADDRESS"]
+                    [--gateway=GATEWAY] [--dns=DNS] [--macaddress="MACADDRESS"]
+                    [--mtu=MTU] [--dhcp] [--limitin=VALUE in Kb] [--arpguard=yes/no]
+                    [--ipguard=yes/no] [--vlan=VLAN/no]
   del-port BRIDGE INTERFACE CONTAINER [USER]
                     Deletes INTERFACE inside CONTAINER and removes its
                     connection to Open vSwitch BRIDGE. e.g.:
@@ -708,6 +705,11 @@ case $1 in
     "add-port")
         shift
         add_port "$@"
+        exit 0
+        ;;
+    "set-port")
+        shift
+        set_port "$@"
         exit 0
         ;;
     "del-port")
