@@ -424,11 +424,11 @@ add_port () {
     
     if [ -n "$LIMITIN" ]; then
       
-      if ovs-vsctl set interface $HOST_INTERFACE ingress_policing_rate=$LIMITIN;then :;else
+      if ovs_vsctl set interface $HOST_INTERFACE ingress_policing_rate=$LIMITIN;then :;else
           echo >&2 "$UTIL: Failed to set ingress limit to INTERFACE=$HOST_INTERFACE"
           exit 1
       fi
-      if ovs-vsctl set interface $HOST_INTERFACE ingress_policing_burst=$LIMITIN;then :;else
+      if ovs_vsctl set interface $HOST_INTERFACE ingress_policing_burst=$LIMITIN;then :;else
           echo >&2 "$UTIL: Failed to set ingress limit to INTERFACE=$HOST_INTERFACE"
           exit 1
       fi
@@ -525,14 +525,14 @@ flush () {
       exit 1
   fi
   
-  if ovs-vsctl list bridge $BRIDGE > /dev/null 2>&1; then :; else
+  if ovs_vsctl list bridge $BRIDGE > /dev/null 2>&1; then :; else
     echo >&2 "$UTIL: Failed to get ports from $BRIDGE"
     exit 1
   fi
   
-  for PORT in `ovs-vsctl --columns=ports --format=table --data=bare --no-headings list bridge $BRIDGE`
+  for PORT in `ovs_vsctl --columns=ports --format=table --data=bare --no-headings list bridge $BRIDGE`
   do
-    for NAME in `ovs-vsctl --columns=_uuid,name --format=csv --data=bare --no-headings list port`
+    for NAME in `ovs_vsctl --columns=_uuid,name --format=csv --data=bare --no-headings list port`
     do
       
       PORT_UUID=`echo $NAME | cut -d ',' -f 1`
@@ -540,9 +540,9 @@ flush () {
       
       if [ "$PORT" == "$PORT_UUID" ]; then
         
-        if ovs-vsctl --columns=error --format=csv --data=bare --no-headings list interface $PORT_NAME | \
+        if ovs_vsctl --columns=error --format=csv --data=bare --no-headings list interface $PORT_NAME | \
         grep "No such device" > /dev/null; then
-          ovs-vsctl del-port $BRIDGE $PORT_NAME
+          ovs_vsctl del-port $BRIDGE $PORT_NAME
         fi
       fi
     done  
