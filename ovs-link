@@ -221,6 +221,7 @@ add_port () {
       # Create a veth pair.
       ID=`uuidgen | sed 's/-//g'`
       PORTNAME="${ID:0:13}"
+      HOST_INTERFACE="${PORTNAME}_l"
       ip link add "${PORTNAME}_l" type veth peer name "${PORTNAME}_c"
 
       # Add one end of veth to OVS bridge.
@@ -378,7 +379,8 @@ add_port () {
       
       if [ "$RUNTIME" = "kata-runtime" -o "$RUNTIME" = "runc" ]; then
         
-        if FILE=`docker exec $CONTAINER dhclient "$INTERFACE" 2>&1 | awk '{print $4}' | tail -1 | tr -d ''"'"''`; then :; else
+        if FILE=`docker exec $CONTAINER dhclient "$INTERFACE" 2>&1 | awk '{print $4}' \
+        | tail -1 | tr -d ''"'"''`; then :; else
             echo >&2 "$UTIL: Failed to get ADDRESS from DHCP of $INTERFACE in the container"
             exit 1
         fi
@@ -394,7 +396,8 @@ add_port () {
       
       if [ "$RUNTIME" = "singularity" ]; then
         
-        if FILE=`singularity exec instance://${CONTAINER} dhclient "$INTERFACE" 2>&1 | awk '{print $4}' | tail -1 | tr -d ''"'"''`; then :; else
+        if FILE=`singularity exec instance://${CONTAINER} dhclient "$INTERFACE" 2>&1 | awk \
+        '{print $4}' | tail -1 | tr -d ''"'"''`; then :; else
             echo >&2 "$UTIL: Failed to get ADDRESS from DHCP of $INTERFACE in the container"
             exit 1
         fi
@@ -417,6 +420,19 @@ add_port () {
           fi
       fi
       
+    fi
+    
+    if [ -n "$LIMITIN" ]; then
+      
+      if ovs-vsctl set interface $HOST_INTERFACE ingress_policing_rate=$LIMITIN;then :;else
+          echo >&2 "$UTIL: Failed to set ingress limit to INTERFACE=$HOST_INTERFACE"
+          exit 1
+      fi
+      if ovs-vsctl set interface $HOST_INTERFACE ingress_policing_burst=$LIMITIN;then :;else
+          echo >&2 "$UTIL: Failed to set ingress limit to INTERFACE=$HOST_INTERFACE"
+          exit 1
+      fi
+
     fi
 
 }
@@ -524,7 +540,8 @@ flush () {
       
       if [ "$PORT" == "$PORT_UUID" ]; then
         
-        if ovs-vsctl --columns=error --format=csv --data=bare --no-headings list interface $PORT_NAME | grep "No such device" > /dev/null; then
+        if ovs-vsctl --columns=error --format=csv --data=bare --no-headings list interface $PORT_NAME | \
+        grep "No such device" > /dev/null; then
           ovs-vsctl del-port $BRIDGE $PORT_NAME
         fi
       fi
