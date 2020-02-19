@@ -23,8 +23,8 @@ ovs_vsctl () {
 
 create_netns_link () {
     mkdir -p /var/run/netns
-    if [ ! -e /var/run/netns/"$PID" ]; then
-        ln -s /proc/"$PID"/ns/net /var/run/netns/"$PID"
+    if [ ! -e /var/run/netns/"$CONTAINER_ID" ]; then
+        ln -s /proc/"$CONTAINER_ID"/ns/net /var/run/netns/"$CONTAINER_ID"
         trap 'delete_netns_link' 0
         for signal in 1 2 3 13 14 15; do
             trap 'delete_netns_link; trap - $signal; kill -$signal $$' $signal
@@ -33,12 +33,12 @@ create_netns_link () {
 }
 
 delete_netns_link () {
-    rm -f /var/run/netns/"$PID"
+    rm -f /var/run/netns/"$CONTAINER_ID"
 }
 
 get_port_for_container_interface () {
-    CONTAINER="$1"
-    INTERFACE="$2"
+    local CONTAINER="$1"
+    local INTERFACE="$2"
 
     PORT=`ovs_vsctl --data=bare --no-heading --columns=name find interface \
              external_ids:container_id="$CONTAINER"  \
@@ -51,18 +51,16 @@ get_port_for_container_interface () {
 }
 
 get_runtime () {
-    CONTAINER="$1"
-    USER="$2"
+    local CONTAINER="$1"
+    local USER="$2"
     
     if DOCKER=`search_path docker` && SINGULARITY=`search_path singularity` && LXC=`search_path lxc-start`; then :; else
       echo >&2 "$UTIL Failed to get container RUNTIME : singularity or docker binary doesn't exists"
       exit 1
     fi
     
-    if [ $DOCKER = 0 ]; then :; else
-
+    if [ "$DOCKER" = "0" ]; then
       for ID in `docker ps -q`; do
-        
         if [ "$ID" = "$CONTAINER" ]; then
           if RUNTIME=`docker inspect -f '{{.HostConfig.Runtime}}' "$CONTAINER" 2>/dev/null`; then 
             echo $RUNTIME
@@ -72,10 +70,8 @@ get_runtime () {
       done
     fi
     
-    if [ $SINGULARITY = 0 ]; then :; else
-      
+    if [ "$SINGULARITY" = "0" ]; then
       SINGULARITY_LIST=`singularity instance list -u "$USER" "$CONTAINER" 2>/dev/null | wc -l`
-
       if [ $SINGULARITY_LIST = 2 ]; then
         RUNTIME="singularity"
         echo $RUNTIME
@@ -83,8 +79,7 @@ get_runtime () {
       fi
     fi
     
-    if [ $LXC = 0 ]; then
-      
+    if [ "$LXC" = "0" ]; then
       if STATE=`sudo -i -u $USER lxc-info --state --name="$CONTAINER" 2>/dev/null | awk '{print $2}'`;then
         if [ "$STATE" = "RUNNING" ]; then
           RUNTIME="lxc"
@@ -92,7 +87,6 @@ get_runtime () {
           exit 0
         fi
       fi
-      
     fi
     
     echo >&2 "$UTIL Failed to get container RUNTIME for CONTAINER=$CONTAINER"
@@ -101,9 +95,9 @@ get_runtime () {
 }
 
 get_pid () {
-  RUNTIME="$1"
-  CONTAINER="$2"
-  USER="$3"
+  local RUNTIME="$1"
+  local CONTAINER="$2"
+  local USER="$3"
   
   if [ "$RUNTIME" = "runc" -o "$RUNTIME" = "kata-runtime" -o "$RUNTIME" = "runsc" ]; then
     if PID=`docker inspect -f '{{.State.Pid}}' "$CONTAINER"`; then :; else
@@ -125,17 +119,15 @@ get_pid () {
 }
 
 get_mac_address () {
-  RUNTIME="$1"
-  CONTAINER="$2"
-  INTERFACE="$3"
+  local RUNTIME="$1"
+  local CONTAINER="$2"
+  local INTERFACE="$3"
   
   if [ "$RUNTIME" = "kata-runtime" ]; then
-    
     if MAC=`docker exec $CONTAINER  ip addr show $INTERFACE | awk '/link\/ether/ {print $2}'`; then :; else
         echo >&2 "$UTIL: Failed to get IP Address of $INTERFACE in the container"
         exit 1
     fi
-    
   elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
     MAC=`ip netns exec "$CONTAINER" ip addr show $INTERFACE | awk '/link\/ether/ {print $2}'`
   fi
@@ -144,18 +136,16 @@ get_mac_address () {
 }
 
 get_ip_address () {
-  RUNTIME="$1"
-  CONTAINER="$2"
-  INTERFACE="$3"
+  local RUNTIME="$1"
+  local CONTAINER="$2"
+  local INTERFACE="$3"
   
   if [ "$RUNTIME" = "kata-runtime" ]; then
-    
     if IP=`docker exec $CONTAINER ip -o -4 addr show $INTERFACE | \
     awk '{split($4,ip,"/");print ip[1]}'`; then :; else
         echo >&2 "$UTIL: Failed to get IP Address of $INTERFACE in the container"
         exit 1
     fi
-    
   elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
     IP=`ip netns exec "$CONTAINER" ip -o -4 addr show $INTERFACE | awk '{split($4,ip,"/");print ip[1]}'`
   fi
@@ -164,11 +154,21 @@ get_ip_address () {
 }
 
 delete_ebtables_rules () {
-  PORT="$1"
+  local PORT="$1"
+  local ARPGUARD="$2"
+  local IPGUARD="$3"
   
   for CHAIN in "INPUT" "FORWARD"; do
-    RULE_NUMBER_LOW=`ebtables -t filter -L $CHAIN --Ln | awk '/'$PORT'/ {print $1}' | tr -d '.' | head -n 1`
-    RULE_NUMBER_HIGH=`ebtables -t filter -L $CHAIN --Ln | awk '/'$PORT'/ {print $1}' | tr -d '.' | tail -n 1`
+    if [ "$ARPGUARD" = "1" -a "$IPGUARD" = "0" ]; then
+      RULE_NUMBER_LOW=`ebtables -t filter -L $CHAIN --Ln | awk '/'$PORT'/ && $0!~/IPv4/ {print $1}' | tr -d '.' | head -n 1`
+      RULE_NUMBER_HIGH=`ebtables -t filter -L $CHAIN --Ln | awk '/'$PORT'/ && $0!~/IPv4/ {print $1}' | tr -d '.' | tail -n 1`
+    elif [ "$ARPGUARD" = "0" -a "$IPGUARD" = "1" ]; then
+      RULE_NUMBER_LOW=`ebtables -t filter -L $CHAIN --Ln | awk '/'$PORT'/ && $0~/IPv4/ {print $1}' | tr -d '.' | head -n 1`
+      RULE_NUMBER_HIGH=`ebtables -t filter -L $CHAIN --Ln | awk '/'$PORT'/ && $0~/IPv4/ {print $1}' | tr -d '.' | tail -n 1`
+    else
+      RULE_NUMBER_LOW=`ebtables -t filter -L $CHAIN --Ln | awk '/'$PORT'/ {print $1}' | tr -d '.' | head -n 1`
+      RULE_NUMBER_HIGH=`ebtables -t filter -L $CHAIN --Ln | awk '/'$PORT'/ {print $1}' | tr -d '.' | tail -n 1`
+    fi
     
     if [ -n "$RULE_NUMBER_LOW" -a -n "$RULE_NUMBER_HIGH" ]; then
       ebtables -t filter -D $CHAIN ${RULE_NUMBER_LOW}:${RULE_NUMBER_HIGH}
@@ -177,58 +177,260 @@ delete_ebtables_rules () {
   
 }
 
-set_limit_bandwith_interface () {
-    HOST_INTERFACE="$1"
-    LIMITIN="$2"
+set_ip_address () {
+  local RUNTIME="$1"
+  local CONTAINER="$2"
+  local INTERFACE="$3"
+  local ADDRESS="$4"
   
-    if ovs_vsctl set interface $HOST_INTERFACE ingress_policing_rate=$LIMITIN;then :;else
-        echo >&2 "$UTIL: Failed to set ingress limit to INTERFACE=$HOST_INTERFACE"
+  if [ "$RUNTIME" = "kata-runtime" ]; then
+    if docker exec $CONTAINER ip addr flush dev "$INTERFACE" > /dev/null 2>&1; then :; else
+        echo >&2 "$UTIL: Failed to flush ADDRESS of $INTERFACE in the container"
         exit 1
     fi
-    if ovs_vsctl set interface $HOST_INTERFACE ingress_policing_burst=$LIMITIN;then :;else
-        echo >&2 "$UTIL: Failed to set ingress limit to INTERFACE=$HOST_INTERFACE"
+    docker exec $CONTAINER ip addr add "$ADDRESS" dev "$INTERFACE"
+  elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
+    ip netns exec "$CONTAINER" ip addr flush dev "$INTERFACE"
+    ip netns exec "$CONTAINER" ip addr add "$ADDRESS" dev "$INTERFACE"
+  fi
+  
+}
+
+set_gateway () {
+  local RUNTIME="$1"
+  local CONTAINER="$2"
+  local INTERFACE="$3"
+  local GATEWAY="$4"
+  
+  if [ "$RUNTIME" = "kata-runtime" ]; then
+    if docker exec $CONTAINER ip route delete default > /dev/null 2>&1; then :; else
+        echo >&2 "$UTIL: Failed to delete the default route in the container"
         exit 1
     fi
+    if docker exec $CONTAINER ip route add default via "$GATEWAY" > /dev/null 2>&1; then :; else
+        echo >&2 "$UTIL: Failed to set the GATEWAY in the container"
+        exit 1
+    fi
+  elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
+    ip netns exec "$CONTAINER" ip route delete default 2>/dev/null
+    ip netns exec "$CONTAINER" ip route add default via "$GATEWAY"
+  fi
+  
+}
+
+set_mtu () {
+  local RUNTIME="$1"
+  local CONTAINER="$2"
+  local INTERFACE="$3"
+  local MTU="$4"
+  
+  if [ "$RUNTIME" = "kata-runtime" ]; then
+    if docker exec $CONTAINER ip link set dev "$INTERFACE" mtu "$MTU" > /dev/null 2>&1; then :; else
+        echo >&2 "$UTIL: Failed to set the MTU of $INTERFACE in the container"
+        exit 1
+    fi
+  elif [ "$RUNTIME" = "runc"  -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc"  ]; then
+    ip netns exec "$CONTAINER" ip link set dev "$INTERFACE" mtu "$MTU"
+  fi
+  
+}
+
+set_mac_address () {
+  local RUNTIME="$1"
+  local CONTAINER="$2"
+  local INTERFACE="$3"
+  local MACADDRESS="$4"
+  
+  if [ "$RUNTIME" = "kata-runtime" ]; then
+    if docker exec $CONTAINER ip link set dev "$INTERFACE" address "$MACADDRESS" > /dev/null 2>&1; then :; else
+        echo >&2 "$UTIL: Failed to set the MACADDRESS of $INTERFACE in the container"
+        exit 1
+    fi
+  elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
+    ip netns exec "$CONTAINER" ip link set dev "$INTERFACE" address "$MACADDRESS"
+  fi
+  
+}
+
+set_dns () {
+  local RUNTIME="$1"
+  local CONTAINER="$2"
+  local INTERFACE="$3"
+  local USER="$4"
+  local DNS="$5"
+  
+  if [ "$RUNTIME" = "kata-runtime" -o "$RUNTIME" = "runc" ]; then
+      if docker exec $CONTAINER bash -c "echo nameserver $DNS > /etc/resolv.conf";then :; else
+          echo >&2 "$UTIL: Failed to set the DNS in the container"
+          exit 1
+      fi
+  elif [ "$RUNTIME" = "singularity" ]; then
+      if singularity exec instance://${CONTAINER} bash -c "echo nameserver $DNS > /etc/resolv.conf";\
+      then :; else
+          echo >&2 "$UTIL: Failed to set the DNS in the container"
+          exit 1
+      fi
+  elif [ "$RUNTIME" = "lxc" ]; then
+      if sudo -i -u $USER -- lxc-attach --name=$CONTAINER -- bash -c "echo nameserver $DNS > /etc/resolv.conf";\
+      then :; else
+          echo >&2 "$UTIL: Failed to set the DNS in the container"
+          exit 1
+      fi
+  fi
+  
+}
+
+clean_dhclient () {
+  local RUNTIME="$1"
+  local CONTAINER="$2"
+  local INTERFACE="$3"
+  local USER="$4"
+  
+  if [ "$RUNTIME" = "kata-runtime" -o "$RUNTIME" = "runc" ]; then
+    DHCLIENT=`docker exec $CONTAINER pgrep -f "dhclient $INTERFACE"`
+    docker exec $CONTAINER kill $DHCLIENT 2>/dev/null
+  fi
+  
+  if [ "$RUNTIME" = "singularity" ]; then
+    DHCLIENT=`singularity exec instance://${CONTAINER} pgrep -f "dhclient $INTERFACE"`
+    singularity exec instance://${CONTAINER} kill $DHCLIENT 2>/dev/null
+  fi
+  
+  if [ "$RUNTIME" = "lxc" ]; then
+    DHCLIENT=`sudo -i -u $USER -- lxc-attach --name=$CONTAINER -- pgrep -f "dhclient $INTERFACE"`
+    sudo -i -u $USER -- lxc-attach --name=$CONTAINER -- kill $DHCLIENT 2>/dev/null
+  fi
+  
+}
+
+set_dhcp () {
+  local RUNTIME="$1"
+  local CONTAINER="$2"
+  local INTERFACE="$3"
+  local USER="$4"
+  
+  clean_dhclient "$RUNTIME" "$CONTAINER" "$INTERFACE" "$USER"
+  
+  if [ "$RUNTIME" = "kata-runtime" -o "$RUNTIME" = "runc" ]; then
+    
+    if docker exec $CONTAINER ip addr flush dev "$INTERFACE" > /dev/null 2>&1; then :; else
+        echo >&2 "$UTIL: Failed to flush ADDRESS of $INTERFACE in the container"
+        exit 1
+    fi
+    if FILE=`docker exec $CONTAINER dhclient "$INTERFACE" 2>&1 | awk '{print $4}' \
+    | tail -1 | tr -d ''"'"''`; then :; else
+        echo >&2 "$UTIL: Failed to get ADDRESS from DHCP of $INTERFACE in the container"
+        exit 1
+    fi
+    if docker exec $CONTAINER ls $FILE > /dev/null 2>&1; then :; else
+        echo >&2 "$UTIL: Failed to set DNS of $INTERFACE in the container"
+        exit 1
+    fi
+    docker exec $CONTAINER bash -c "cat $FILE > /etc/resolv.conf"
+  fi
+  
+  if [ "$RUNTIME" = "singularity" ]; then
+    
+    if FILE=`singularity exec instance://${CONTAINER} dhclient "$INTERFACE" 2>&1 | awk \
+    '{print $4}' | tail -1 | tr -d ''"'"''`; then :; else
+        echo >&2 "$UTIL: Failed to get ADDRESS from DHCP of $INTERFACE in the container"
+        exit 1
+    fi
+    if singularity exec instance://${CONTAINER} ls $FILE > /dev/null 2>&1; then :; else
+        echo >&2 "$UTIL: Failed to set DNS of $INTERFACE in the container"
+        exit 1
+    fi
+    singularity exec instance://${CONTAINER} bash -c "cat $FILE > /etc/resolv.conf"
+  fi
+  
+  if [ "$RUNTIME" = "lxc" ]; then
+
+    if sudo -i -u $USER -- lxc-attach --name=$CONTAINER dhclient $INTERFACE 2>/dev/null;\
+    then :; else
+        echo >&2 "$UTIL: Failed to set the DNS in the container"
+        exit 1
+    fi
+  fi
+  
+}
+
+set_bandwith_limit_interface () {
+  local INTERFACE="$1"
+  local LIMITIN="$2"
+  
+  if ovs_vsctl set interface "$INTERFACE" ingress_policing_rate=$LIMITIN;then :;else
+      echo >&2 "$UTIL: Failed to set ingress limit to INTERFACE=$INTERFACE"
+      exit 1
+  fi
+  if ovs_vsctl set interface "$INTERFACE" ingress_policing_burst=$LIMITIN;then :;else
+      echo >&2 "$UTIL: Failed to set ingress limit to INTERFACE=$INTERFACE"
+      exit 1
+  fi
     
 }
 
+set_vlan () {
+  local INTERFACE="$1"
+  local VLAN="$2"
+  
+  if [ "$VLAN" = "0" ]; then
+    if ovs_vsctl remove port "$PORT" tag "$VLAN";then :;else
+        echo >&2 "$UTIL: Failed to set VLAN $VLAN to INTERFACE=$INTERFACE"
+        exit 1
+    fi
+  else
+    if ovs_vsctl set port "$PORT" tag="$VLAN";then :;else
+        echo >&2 "$UTIL: Failed to set VLAN $VLAN to INTERFACE=$INTERFACE"
+        exit 1
+    fi
+  fi
+
+}
+
 set_arp_guard () {
-    RUNTIME="$1"
-    CONTAINER="$2"
-    INTERFACE="$3"
-    HOST_INTERFACE="$4"
-    
-    MAC=`get_mac_address $RUNTIME $CONTAINER $INTERFACE`
-    IP=`get_ip_address $RUNTIME $CONTAINER $INTERFACE`
-    
-    ebtables -t filter -A INPUT -s ! $MAC -i $HOST_INTERFACE -j DROP
-    ebtables -t filter -A INPUT -p ARP -i $HOST_INTERFACE --arp-mac-src ! $MAC -j DROP
-    ebtables -t filter -A INPUT -p ARP -i $HOST_INTERFACE --arp-ip-src ! $IP -j DROP
+  local RUNTIME="$1"
+  local CONTAINER="$2"
+  local INTERFACE="$3"
+  local HOST_INTERFACE="$4"
+  
+  MAC=`get_mac_address $RUNTIME $CONTAINER $INTERFACE`
+  IP=`get_ip_address $RUNTIME $CONTAINER $INTERFACE`
+  
+  if ebtables -t filter -A INPUT -s ! $MAC -i $HOST_INTERFACE -j DROP 2>/dev/null;then :;else
+      echo >&2 "$UTIL: Failed to set ARPGUARD to INTERFACE=$HOST_INTERFACE"
+      exit 1
+  fi
+  ebtables -t filter -A INPUT -p ARP -i $HOST_INTERFACE --arp-mac-src ! $MAC -j DROP 2>/dev/null
+  ebtables -t filter -A INPUT -p ARP -i $HOST_INTERFACE --arp-ip-src ! $IP -j DROP 2>/dev/null
     
 }
 
 set_ip_guard () {
-    RUNTIME="$1"
-    CONTAINER="$2"
-    INTERFACE="$3"
-    HOST_INTERFACE="$4"
-    
-    MAC=`get_mac_address $RUNTIME $CONTAINER $INTERFACE`
-    IP=`get_ip_address $RUNTIME $CONTAINER $INTERFACE`
-    
-    ebtables -t filter -A INPUT -p IPv4 -s $MAC -i $HOST_INTERFACE --ip-src 0.0.0.0 --ip-dst 255.255.255.255 --ip-proto udp --ip-dport 67 -j ACCEPT
-    ebtables -t filter -A INPUT -p IPv4 -i $HOST_INTERFACE --ip-src ! $IP -j DROP
-    ebtables -t filter -A FORWARD -p IPv4 -i $HOST_INTERFACE --ip-src ! $IP -j DROP
+  local RUNTIME="$1"
+  local CONTAINER="$2"
+  local INTERFACE="$3"
+  local HOST_INTERFACE="$4"
+  
+  MAC=`get_mac_address $RUNTIME $CONTAINER $INTERFACE`
+  IP=`get_ip_address $RUNTIME $CONTAINER $INTERFACE`
+  
+  if ebtables -t filter -A INPUT -p IPv4 -s $MAC -i $HOST_INTERFACE --ip-src 0.0.0.0 \
+  --ip-dst 255.255.255.255 --ip-proto udp --ip-dport 67 -j ACCEPT 2>/dev/null;then :;else
+  echo >&2 "$UTIL: Failed to set IPPGUARD to INTERFACE=$HOST_INTERFACE"
+  exit 1
+  fi
+  ebtables -t filter -A INPUT -p IPv4 -i $HOST_INTERFACE --ip-src ! $IP -j DROP 2>/dev/null
+  ebtables -t filter -A FORWARD -p IPv4 -i $HOST_INTERFACE --ip-src ! $IP -j DROP 2>/dev/null
     
 }
 
 add_port () {
     BRIDGE="$1"
     INTERFACE="$2"
-    CONTAINER="$3"
+    CONTAINER_NAME="$3"
     USER="root"
 
-    if [ -z "$BRIDGE" ] || [ -z "$INTERFACE" ] || [ -z "$CONTAINER" ]; then
+    if [ -z "$BRIDGE" ] || [ -z "$INTERFACE" ] || [ -z "$CONTAINER_NAME" ]; then
         echo >&2 "$UTIL add-port: not enough arguments (use --help for help)"
         exit 1
     fi
@@ -283,16 +485,16 @@ add_port () {
         esac
     done
 
-    if RUNTIME=`get_runtime "$CONTAINER" "$USER"`; then :; else
+    if RUNTIME=`get_runtime "$CONTAINER_NAME" "$USER"`; then :; else
       exit 1
     fi
-        
+
     # Check if a port is already attached for the given container and interface
-    PORT=`get_port_for_container_interface "$CONTAINER" "$INTERFACE" \
+    PORT=`get_port_for_container_interface "$CONTAINER_NAME" "$INTERFACE" \
             2>/dev/null`
     if [ -n "$PORT" ]; then
         echo >&2 "$UTIL: Port already attached" \
-                 "for CONTAINER=$CONTAINER and INTERFACE=$INTERFACE"
+                 "for CONTAINER=$CONTAINER_NAME and INTERFACE=$INTERFACE"
         exit 1
     fi
 
@@ -304,15 +506,17 @@ add_port () {
     
     if [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
       
-      if PID=`get_pid "$RUNTIME" "$CONTAINER" "$USER"`;then :; else
+      if PID=`get_pid "$RUNTIME" "$CONTAINER_NAME" "$USER"`;then :; else
         exit 1
       fi
+      
+      CONTAINER_ID=$PID
       
       create_netns_link
       
       # chack if interface exists inside the container
-      if ip netns exec "$PID" ip link | grep "$INTERFACE" >/dev/null;then
-        echo >&2 "$UTIL: INTERFACE=$INTERFACE exists in CONTAINER=$CONTAINER"
+      if ip netns exec "$CONTAINER_ID" ip link | grep "$INTERFACE" >/dev/null;then
+        echo >&2 "$UTIL: INTERFACE=$INTERFACE exists in CONTAINER=$CONTAINER_NAME"
         exit 1
       fi
 
@@ -325,7 +529,7 @@ add_port () {
       # Add one end of veth to OVS bridge.
       if ovs_vsctl --may-exist add-port "$BRIDGE" "${PORTNAME}_l" \
          -- set interface "${PORTNAME}_l" \
-         external_ids:container_id="$CONTAINER" \
+         external_ids:container_id="$CONTAINER_NAME" \
          external_ids:container_iface="$INTERFACE"; then :; else
           echo >&2 "$UTIL: Failed to add "${PORTNAME}_l" port to bridge $BRIDGE"
           ip link delete "${PORTNAME}_l"
@@ -335,20 +539,22 @@ add_port () {
       ip link set "${PORTNAME}_l" up
 
       # Move "${PORTNAME}_c" inside the container and changes its name.
-      ip link set "${PORTNAME}_c" netns "$PID"
-      ip netns exec "$PID" ip link set dev "${PORTNAME}_c" name "$INTERFACE"
-      ip netns exec "$PID" ip link set "$INTERFACE" up
+      ip link set "${PORTNAME}_c" netns "$CONTAINER_ID"
+      ip netns exec "$CONTAINER_ID" ip link set dev "${PORTNAME}_c" name "$INTERFACE"
+      ip netns exec "$CONTAINER_ID" ip link set "$INTERFACE" up
     
     else
       
+      CONTAINER_ID=$CONTAINER_NAME
+      
       # Get the interface that correspond to the container
       HOST_INTERFACE=`ip -o link | awk '/if'$(nsenter \
-      --net=$(docker inspect -f '{{.NetworkSettings.SandboxKey}}' $CONTAINER) \
+      --net=$(docker inspect -f '{{.NetworkSettings.SandboxKey}}' $CONTAINER_ID) \
       ip link | awk '/'$INTERFACE'/ {print $1}' | tr -d ':')'/ {split($2,id,"@");print id[1]}'`
 
       if [ $? -ne 0 ]; then
           echo >&2 "$UTIL: Failed to get the interface on the host" \
-                   "for CONTAINER=$CONTAINER and INTERFACE=$INTERFACE"
+                   "for CONTAINER=$CONTAINER_ID and INTERFACE=$INTERFACE"
           exit 1
       fi
       
@@ -364,7 +570,7 @@ add_port () {
       # Add the interface to the OVS BRIDGE
       if ovs_vsctl --may-exist add-port "$BRIDGE" "$HOST_INTERFACE" \
          -- set interface "$HOST_INTERFACE" \
-         external_ids:container_id="$CONTAINER" \
+         external_ids:container_id="$CONTAINER_NAME" \
          external_ids:container_iface="$INTERFACE"; then :; else
           echo >&2 "$UTIL: Failed to add "$HOST_INTERFACE" port to bridge $BRIDGE"
           exit 1
@@ -375,166 +581,72 @@ add_port () {
     fi
     
     if [ -n "$MTU" ]; then
-      if [ "$RUNTIME" = "kata-runtime" ]; then
-        if docker exec $CONTAINER ip link set dev "$INTERFACE" mtu "$MTU" > /dev/null 2>&1; then :; else
-            echo >&2 "$UTIL: Failed to set the MTU of $INTERFACE in the container"
-            exit 1
-        fi
-      elif [ "$RUNTIME" = "runc"  -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc"  ]; then
-        ip netns exec "$PID" ip link set dev "$INTERFACE" mtu "$MTU"
+      if set_mtu "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$MTU"; then :; else
+          exit 1
       fi
     fi
 
     if [ -n "$ADDRESS" ]; then
-      if [ "$RUNTIME" = "kata-runtime" ]; then
-        if docker exec $CONTAINER ip addr flush dev "$INTERFACE" > /dev/null 2>&1; then :; else
-            echo >&2 "$UTIL: Failed to flush ADDRESS of $INTERFACE in the container"
-            exit 1
-        fi
-        docker exec $CONTAINER ip addr add "$ADDRESS" dev "$INTERFACE"
-      elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
-        ip netns exec "$PID" ip addr flush dev "$INTERFACE"
-        ip netns exec "$PID" ip addr add "$ADDRESS" dev "$INTERFACE"
+      if set_ip_address "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$ADDRESS"; then :; else
+          exit 1
       fi
     fi
 
     if [ -n "$MACADDRESS" ]; then
-      if [ "$RUNTIME" = "kata-runtime" ]; then
-        if docker exec $CONTAINER ip link set dev "$INTERFACE" address "$MACADDRESS" > /dev/null 2>&1; then :; else
-            echo >&2 "$UTIL: Failed to set the MACADDRESS of $INTERFACE in the container"
-            exit 1
-        fi
-      elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
-        ip netns exec "$PID" ip link set dev "$INTERFACE" address "$MACADDRESS"
+      if set_mac_address "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$MACADDRESS"; then :; else
+          exit 1
       fi
     fi
 
     if [ -n "$GATEWAY" ]; then
-      if [ "$RUNTIME" = "kata-runtime" ]; then
-        if docker exec $CONTAINER ip route delete default > /dev/null 2>&1; then :; else
-            echo >&2 "$UTIL: Failed to delete the default route in the container"
-            exit 1
-        fi
-        if docker exec $CONTAINER ip route add default via "$GATEWAY" > /dev/null 2>&1; then :; else
-            echo >&2 "$UTIL: Failed to set the GATEWAY in the container"
-            exit 1
-        fi
-      elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
-        ip netns exec "$PID" ip route delete default
-        ip netns exec "$PID" ip route add default via "$GATEWAY"
+      if set_gateway "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$GATEWAY"; then :; else
+          exit 1
       fi
-      
     fi
     
     if [ -n "$DNS" ]; then
-      if [ "$RUNTIME" = "kata-runtime" -o "$RUNTIME" = "runc" ]; then
-          if docker exec $CONTAINER bash -c "echo nameserver $DNS > /etc/resolv.conf";then :; else
-              echo >&2 "$UTIL: Failed to set the DNS in the container"
-              exit 1
-          fi
-      elif [ "$RUNTIME" = "singularity" ]; then
-          if singularity exec instance://${CONTAINER} bash -c "echo nameserver $DNS > /etc/resolv.conf";\
-          then :; else
-              echo >&2 "$UTIL: Failed to set the DNS in the container"
-              exit 1
-          fi
-      elif [ "$RUNTIME" = "lxc" ]; then
-          if sudo -i -u $USER -- lxc-attach --name=$CONTAINER bash -c "echo nameserver $DNS > /etc/resolv.conf";\
-          then :; else
-              echo >&2 "$UTIL: Failed to set the DNS in the container"
-              exit 1
-          fi
+      if set_dns "$RUNTIME" "$CONTAINER_NAME" "$INTERFACE" "$USER" "$DNS"; then :; else
+          exit 1
       fi
     fi
     
     if [ -z "$ADDRESS" -a "$DHCP" ]; then
-      if [ "$RUNTIME" = "kata-runtime" ]; then
-        if docker exec $CONTAINER ip addr flush dev "$INTERFACE" > /dev/null 2>&1; then :; else
-            echo >&2 "$UTIL: Failed to flush ADDRESS of $INTERFACE in the container"
-            exit 1
-        fi
-      fi
-      
-      if [ "$RUNTIME" = "kata-runtime" -o "$RUNTIME" = "runc" ]; then
-        if FILE=`docker exec $CONTAINER dhclient "$INTERFACE" 2>&1 | awk '{print $4}' \
-        | tail -1 | tr -d ''"'"''`; then :; else
-            echo >&2 "$UTIL: Failed to get ADDRESS from DHCP of $INTERFACE in the container"
-            exit 1
-        fi
-        if docker exec $CONTAINER ls $FILE > /dev/null 2>&1; then :; else
-            echo >&2 "$UTIL: Failed to set DNS of $INTERFACE in the container"
-            exit 1
-        fi
-        docker exec $CONTAINER bash -c "cat $FILE > /etc/resolv.conf"
-      fi
-      
-      if [ "$RUNTIME" = "singularity" ]; then
-        if FILE=`singularity exec instance://${CONTAINER} dhclient "$INTERFACE" 2>&1 | awk \
-        '{print $4}' | tail -1 | tr -d ''"'"''`; then :; else
-            echo >&2 "$UTIL: Failed to get ADDRESS from DHCP of $INTERFACE in the container"
-            exit 1
-        fi
-        if singularity exec instance://${CONTAINER} ls $FILE > /dev/null 2>&1; then :; else
-            echo >&2 "$UTIL: Failed to set DNS of $INTERFACE in the container"
-            exit 1
-        fi
-        singularity exec instance://${CONTAINER} bash -c "cat $FILE > /etc/resolv.conf"
-      fi
-      
-      if [ "$RUNTIME" = "lxc" ]; then
-          if sudo -i -u $USER -- lxc-attach --name=$CONTAINER dhclient $INTERFACE 2>/dev/null;\
-          then :; else
-              echo >&2 "$UTIL: Failed to set the DNS in the container"
-              exit 1
-          fi
+      if set_dhcp "$RUNTIME" "$CONTAINER_NAME" "$INTERFACE" "$USER"; then :; else
+          exit 1
       fi
     fi
     
     if [ -n "$LIMITIN" ]; then
-        if set_limit_interface "$HOST_INTERFACE" "$LIMITIN"; then :; else
-            exit 1
-        fi
+      if set_bandwith_limit_interface "$HOST_INTERFACE" "$LIMITIN"; then :; else
+          exit 1
+      fi
     fi
 
     if [ -n "$ARPGUARD" ]; then
-      if [ "$RUNTIME" = "kata-runtime" ]; then
-          if set_arp_guard "$RUNTIME" "$CONTAINER" "$INTERFACE" "$HOST_INTERFACE"; then :; else
-              exit 1
-          fi
-      elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
-          if set_arp_guard "$RUNTIME" "$PID" "$INTERFACE" "$HOST_INTERFACE"; then :; else
-              exit 1
-          fi
+      if set_arp_guard "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$HOST_INTERFACE"; then :; else
+          exit 1
       fi
     fi
 
     if [ -n "$IPGUARD" ]; then
-      if [ "$RUNTIME" = "kata-runtime" ]; then
-          if set_ip_guard "$RUNTIME" "$CONTAINER" "$INTERFACE" "$HOST_INTERFACE"; then :; else
-              exit 1
-          fi
-      elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
-          if set_ip_guard "$RUNTIME" "$PID" "$INTERFACE" "$HOST_INTERFACE"; then :; else
-              exit 1
-          fi
+      if set_ip_guard "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$HOST_INTERFACE"; then :; else
+          exit 1
       fi
-
     fi
 
 }
 
 set_port () {
-    BRIDGE="$1"
-    INTERFACE="$2"
-    CONTAINER="$3"
+    INTERFACE="$1"
+    CONTAINER_NAME="$2"
     USER="root"
 
-    if [ -z "$BRIDGE" ] || [ -z "$INTERFACE" ] || [ -z "$CONTAINER" ]; then
+    if [ -z "$INTERFACE" ] || [ -z "$CONTAINER_NAME" ]; then
         echo >&2 "$UTIL add-port: not enough arguments (use --help for help)"
         exit 1
     fi
 
-    shift 3
+    shift 2
     while [ $# -ne 0 ]; do
         case $1 in
             --user=*)
@@ -588,117 +700,108 @@ set_port () {
         esac
     done
 
-    if RUNTIME=`get_runtime "$CONTAINER" "$USER"`; then :; else
+    if RUNTIME=`get_runtime "$CONTAINER_NAME" "$USER"`; then :; else
       exit 1
     fi
 
     # Check if a port is already attached for the given container and interface
-    PORT=`get_port_for_container_interface "$CONTAINER" "$INTERFACE" \
+    PORT=`get_port_for_container_interface "$CONTAINER_NAME" "$INTERFACE" \
             2>/dev/null`
     if [ -z "$PORT" ]; then
-        echo >&2 "$UTIL: Port doesn't attach to ovs for CONTAINER=$CONTAINER and INTERFACE=$INTERFACE"
+        echo >&2 "$UTIL: Port doesn't attach to ovs for CONTAINER=$CONTAINER_NAME and INTERFACE=$INTERFACE"
         exit 1
     fi
     
+    HOST_INTERFACE="$PORT"
+    
     if [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
       
-      if PID=`get_pid "$RUNTIME" "$CONTAINER" "$USER"`;then :; else
+      if PID=`get_pid "$RUNTIME" "$CONTAINER_NAME" "$USER"`;then :; else
         exit 1
       fi
       
-      if [ -n "$ADDRESS" -o -n "$MACADDRESS" -o -n "$MTU" -o -n "$GATEWAY" -o -n "$DHCP" ];then
+      CONTAINER_ID=$PID
+      
+      if [ -n "$ADDRESS" -o -n "$MACADDRESS" -o -n "$MTU" -o -n "$GATEWAY" -o -n "$DHCP" -o -n "$ARPGUARD" -o -n "$IPGUARD" ];then
         
         create_netns_link
         
         # chack if interface exists inside the container
-        if ip netns exec "$PID" ip link | grep "$INTERFACE" >/dev/null;then :; else
+        if ip netns exec "$CONTAINER_ID" ip link | grep "$INTERFACE" >/dev/null;then :; else
           echo >&2 "$UTIL: INTERFACE=$INTERFACE exists in CONTAINER=$CONTAINER"
           exit 1
         fi
       fi
     else
-      
-      # Get the interface that correspond to the container
-      HOST_INTERFACE=`ip -o link | awk '/if'$(nsenter \
-      --net=$(docker inspect -f '{{.NetworkSettings.SandboxKey}}' $CONTAINER) \
-      ip link | awk '/'$INTERFACE'/ {print $1}' | tr -d ':')'/ {split($2,id,"@");print id[1]}'`
-      
-      if [ $? -ne 0 ]; then
-          echo >&2 "$UTIL: Failed to get the interface on the host" \
-                   "for CONTAINER=$CONTAINER and INTERFACE=$INTERFACE"
-          exit 1
-      fi
-    fi
-    
-    if [ -n "$ADDRESS" ]; then
-      if [ "$RUNTIME" = "kata-runtime" ]; then
-        if docker exec $CONTAINER ip addr flush dev "$INTERFACE" > /dev/null 2>&1; then :; else
-            echo >&2 "$UTIL: Failed to flush ADDRESS of $INTERFACE in the container"
-            exit 1
-        fi
-        docker exec $CONTAINER ip addr add "$ADDRESS" dev "$INTERFACE"
-      elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
-        ip netns exec "$PID" ip addr flush dev "$INTERFACE"
-        ip netns exec "$PID" ip addr add "$ADDRESS" dev "$INTERFACE"
-      fi
+      CONTAINER_ID=$CONTAINER_NAME
     fi
     
     if [ -n "$MTU" ]; then
-      if [ "$RUNTIME" = "kata-runtime" ]; then
-        if docker exec $CONTAINER ip link set dev "$INTERFACE" mtu "$MTU" > /dev/null 2>&1; then :; else
-            echo >&2 "$UTIL: Failed to set the MTU of $INTERFACE in the container"
-            exit 1
-        fi
-      elif [ "$RUNTIME" = "runc"  -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc"  ]; then
-        ip netns exec "$PID" ip link set dev "$INTERFACE" mtu "$MTU"
+      if set_mtu "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$MTU"; then :; else
+          exit 1
       fi
     fi
-    
+
+    if [ -n "$ADDRESS" ]; then
+      clean_dhclient "$RUNTIME" "$CONTAINER_NAME" "$INTERFACE" "$USER"
+      if set_ip_address "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$ADDRESS"; then :; else
+          exit 1
+      fi
+    fi
+
     if [ -n "$MACADDRESS" ]; then
-      if [ "$RUNTIME" = "kata-runtime" ]; then
-        if docker exec $CONTAINER ip link set dev "$INTERFACE" address "$MACADDRESS" > /dev/null 2>&1; then :; else
-            echo >&2 "$UTIL: Failed to set the MACADDRESS of $INTERFACE in the container"
-            exit 1
-        fi
-      elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
-        ip netns exec "$PID" ip link set dev "$INTERFACE" address "$MACADDRESS"
+      if set_mac_address "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$MACADDRESS"; then :; else
+          exit 1
       fi
     fi
 
     if [ -n "$GATEWAY" ]; then
-      if [ "$RUNTIME" = "kata-runtime" ]; then
-        if docker exec $CONTAINER ip route delete default > /dev/null 2>&1; then :; else
-            echo >&2 "$UTIL: Failed to delete the default route in the container"
-            exit 1
-        fi
-        if docker exec $CONTAINER ip route add default via "$GATEWAY" > /dev/null 2>&1; then :; else
-            echo >&2 "$UTIL: Failed to set the GATEWAY in the container"
-            exit 1
-        fi
-      elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
-        ip netns exec "$PID" ip route delete default
-        ip netns exec "$PID" ip route add default via "$GATEWAY"
+      if set_gateway "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$GATEWAY"; then :; else
+          exit 1
       fi
     fi
     
     if [ -n "$DNS" ]; then
-      if [ "$RUNTIME" = "kata-runtime" -o "$RUNTIME" = "runc" ]; then
-          if docker exec $CONTAINER bash -c "echo nameserver $DNS > /etc/resolv.conf";then :; else
-              echo >&2 "$UTIL: Failed to set the DNS in the container"
-              exit 1
-          fi
-      elif [ "$RUNTIME" = "singularity" ]; then
-          if singularity exec instance://${CONTAINER} bash -c "echo nameserver $DNS > /etc/resolv.conf";\
-          then :; else
-              echo >&2 "$UTIL: Failed to set the DNS in the container"
-              exit 1
-          fi
-      elif [ "$RUNTIME" = "lxc" ]; then
-          if sudo -i -u $USER -- lxc-attach --name=$CONTAINER bash -c "echo nameserver $DNS > /etc/resolv.conf";\
-          then :; else
-              echo >&2 "$UTIL: Failed to set the DNS in the container"
-              exit 1
-          fi
+      if set_dns "$RUNTIME" "$CONTAINER_NAME" "$INTERFACE" "$USER" "$DNS"; then :; else
+          exit 1
+      fi
+    fi
+    
+    if [ -z "$ADDRESS" -a "$DHCP" ]; then
+      if set_dhcp "$RUNTIME" "$CONTAINER_NAME" "$INTERFACE" "$USER"; then :; else
+          exit 1
+      fi
+    fi
+    
+    if [ -n "$LIMITIN" ]; then
+      if set_bandwith_limit_interface "$HOST_INTERFACE" "$LIMITIN"; then :; else
+          exit 1
+      fi
+    fi
+
+    if [ -n "$ARPGUARD" ]; then
+      if [ "$ARPGUARD" = "yes" ]; then
+        if set_arp_guard "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$HOST_INTERFACE"; then :; else
+            exit 1
+        fi
+      else
+        delete_ebtables_rules "$PORT" "1" "0"
+      fi
+    fi
+
+    if [ -n "$IPGUARD" ]; then
+      if [ "$IPGUARD" = "yes" ]; then
+        if set_ip_guard "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$HOST_INTERFACE"; then :; else
+            exit 1
+        fi
+      else
+        delete_ebtables_rules "$PORT" "0" "1"
+      fi
+    fi
+    
+    if [ -n "$VLAN" ]; then
+      if set_vlan "$HOST_INTERFACE" "$VLAN"; then :; else
+          exit 1
       fi
     fi
     
@@ -730,13 +833,15 @@ del_port () {
 
     ovs_vsctl --if-exists del-port "$PORT"
     
+    clean_dhclient "$RUNTIME" "$CONTAINER" "$INTERFACE" "$USER"
+    
     if [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
       ip link delete "$PORT"
     else
       ip link set nomaster dev "$PORT"
     fi
     
-    delete_ebtables_rules "$PORT"
+    delete_ebtables_rules "$PORT" "1" "1"
     
 }
 
@@ -767,33 +872,17 @@ del_ports () {
     for PORT in $PORTS; do
         ovs_vsctl --if-exists del-port "$PORT"
         
+        clean_dhclient "$RUNTIME" "$CONTAINER" "$INTERFACE" "$USER"
+        
         if [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
           ip link delete "$PORT"
         else
           ip link set nomaster dev "$PORT"
         fi
         
-        delete_ebtables_rules "$PORT"
+        delete_ebtables_rules "$PORT" "1" "1"
         
     done
-}
-
-set_vlan () {
-    BRIDGE="$1"
-    INTERFACE="$2"
-    CONTAINER_ID="$3"
-    VLAN="$4"
-
-    if [ "$#" -lt 4 ]; then
-        usage
-        exit 1
-    fi
-
-    PORT=`get_port_for_container_interface "$CONTAINER_ID" "$INTERFACE"`
-    if [ -z "$PORT" ]; then
-        exit 1
-    fi
-    ovs_vsctl set port "$PORT" tag="$VLAN"
 }
 
 flush () {
@@ -823,7 +912,7 @@ flush () {
         grep "No such device" > /dev/null; then
           ovs_vsctl del-port $BRIDGE $PORT_NAME
           
-          delete_ebtables_rules "$PORT_NAME"
+          delete_ebtables_rules "$PORT_NAME" "1" "1"
         fi
       fi
     done  
@@ -853,7 +942,7 @@ Commands:
                     ${UTIL} add-port br-int eth1 c474a0e2830e
                     --ipaddress=192.168.1.2/24 --gateway=192.168.1.1
                     --macaddress="a2:c3:0d:49:7f:f8" --mtu=1450
-  set-port BRIDGE INTERFACE CONTAINER [--user=USER] [--ipaddress="ADDRESS"]
+  set-port INTERFACE CONTAINER [--user=USER] [--ipaddress="ADDRESS"]
                     [--gateway=GATEWAY] [--dns=DNS] [--macaddress="MACADDRESS"]
                     [--mtu=MTU] [--dhcp] [--limitin=VALUE in Kb] [--arpguard=yes/no]
                     [--ipguard=yes/no] [--vlan=VLAN/no]
@@ -864,10 +953,6 @@ Commands:
   del-ports BRIDGE CONTAINER [USER]
                     Removes all Open vSwitch interfaces from CONTAINER. e.g.:
                     ${UTIL} del-ports br-int c474a0e2830e
-  set-vlan BRIDGE INTERFACE CONTAINER VLAN
-                    Configures the INTERFACE of CONTAINER attached to BRIDGE
-                    to become an access port of VLAN. e.g.:
-                    ${UTIL} set-vlan br-int eth1 c474a0e2830e 5
   flush-ports BRIDGE
                     Delete ports where the interface on the host is deleted.
                     ${UTIL} flush-ports br-int
