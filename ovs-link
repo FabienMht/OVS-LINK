@@ -1,0 +1,562 @@
+#!/bin/bash
+# Modified from Nicira Inc by Fabien Mauhourat under GNU GPLv3
+
+# Check for programs we'll need.
+search_path () {
+    save_IFS=$IFS
+    IFS=:
+    for dir in $PATH; do
+        IFS=$save_IFS
+        if test -x "$dir/$1"; then
+            return 0
+        fi
+    done
+    IFS=$save_IFS
+    return 1
+}
+
+ovs_vsctl () {
+    ovs-vsctl --timeout=60 "$@"
+}
+
+create_netns_link () {
+    mkdir -p /var/run/netns
+    if [ ! -e /var/run/netns/"$PID" ]; then
+        ln -s /proc/"$PID"/ns/net /var/run/netns/"$PID"
+        trap 'delete_netns_link' 0
+        for signal in 1 2 3 13 14 15; do
+            trap 'delete_netns_link; trap - $signal; kill -$signal $$' $signal
+        done
+    fi
+}
+
+delete_netns_link () {
+    rm -f /var/run/netns/"$PID"
+}
+
+get_port_for_container_interface () {
+    CONTAINER="$1"
+    INTERFACE="$2"
+
+    PORT=`ovs_vsctl --data=bare --no-heading --columns=name find interface \
+             external_ids:container_id="$CONTAINER"  \
+             external_ids:container_iface="$INTERFACE"`
+    if [ -z "$PORT" ]; then
+        echo >&2 "$UTIL: Failed to find any attached port" \
+                 "for CONTAINER=$CONTAINER and INTERFACE=$INTERFACE"
+    fi
+    echo "$PORT"
+}
+
+get_runtime () {
+    CONTAINER="$1"
+    USER="$2"
+    
+    if [ DOCKER=`search_path docker` -a SINGULARITY=`search_path singularity` ]; then :; else
+      echo >&2 "$UTIL Failed to get container RUNTIME : singularity or docker binary doesn't exists"
+      exit 1
+    fi
+
+    if [ "$DOCKER" ]; then :; else
+
+      if RUNTIME=`docker inspect -f '{{.HostConfig.Runtime}}' "$CONTAINER" 2>/dev/null`; then 
+        echo $RUNTIME
+        exit 0
+      fi
+    fi
+    
+    if [ "$SINGULARITY" ]; then :; else
+    
+      if [[ -z "$USER" ]]; then
+        echo >&2 "$UTIL Failed to get container RUNTIME : you muste specify the user with singularity"
+        exit 1
+      fi
+      
+      SINGULARITY_LIST=`singularity instance list -u "$USER" "$CONTAINER" | wc -l`
+
+      if [ $SINGULARITY_LIST = 2 ]; then
+        RUNTIME="singularity"
+        echo $RUNTIME
+        exit 0
+      fi
+    fi
+    
+    echo >&2 "$UTIL Failed to get container RUNTIME : $CONTAINER doesn't exist"
+    exit 1
+  
+}
+
+
+add_port () {
+    BRIDGE="$1"
+    INTERFACE="$2"
+    CONTAINER="$3"
+    USER=""
+
+    if [ -z "$BRIDGE" ] || [ -z "$INTERFACE" ] || [ -z "$CONTAINER" ]; then
+        echo >&2 "$UTIL add-port: not enough arguments (use --help for help)"
+        exit 1
+    fi
+
+    shift 3
+    while [ $# -ne 0 ]; do
+        case $1 in
+            --user=*)
+                USER=`expr X"$1" : 'X[^=]*=\(.*\)'`
+                shift
+                ;;
+            --ipaddress=*)
+                ADDRESS=`expr X"$1" : 'X[^=]*=\(.*\)'`
+                shift
+                ;;
+            --macaddress=*)
+                MACADDRESS=`expr X"$1" : 'X[^=]*=\(.*\)'`
+                shift
+                ;;
+            --gateway=*)
+                GATEWAY=`expr X"$1" : 'X[^=]*=\(.*\)'`
+                shift
+                ;;
+            --mtu=*)
+                MTU=`expr X"$1" : 'X[^=]*=\(.*\)'`
+                shift
+                ;;
+            --dns=*)
+                DNS=`expr X"$1" : 'X[^=]*=\(.*\)'`
+                shift
+                ;;
+            --dhcp)
+                DHCP=1
+                shift
+                ;;
+            *)
+                echo >&2 "$UTIL add-port: unknown option \"$1\""
+                exit 1
+                ;;
+        esac
+    done
+
+    if RUNTIME=`get_runtime "$CONTAINER" "$USER"`; then :; else
+      exit 1
+    fi
+        
+    # Check if a port is already attached for the given container and interface
+    PORT=`get_port_for_container_interface "$CONTAINER" "$INTERFACE" \
+            2>/dev/null`
+    if [ -n "$PORT" ]; then
+        echo >&2 "$UTIL: Port already attached" \
+                 "for CONTAINER=$CONTAINER and INTERFACE=$INTERFACE"
+        exit 1
+    fi
+
+    if ovs_vsctl br-exists "$BRIDGE" || \
+        ovs_vsctl add-br "$BRIDGE"; then :; else
+        echo >&2 "$UTIL: Failed to create bridge $BRIDGE"
+        exit 1
+    fi
+
+    if [ "$RUNTIME" = "runc" -o "$RUNTIME" = "kata-runtime" -o "$RUNTIME" = "runsc" ]; then
+      if PID=`docker inspect -f '{{.State.Pid}}' "$CONTAINER"`; then :; else
+          echo >&2 "$UTIL: Failed to get the PID of the container"
+          exit 1
+      fi
+    else
+      if PID=`singularity instance list -u "$USER" "$CONTAINER" | awk 'NR==2 {print $2}'`; then :; else
+          echo >&2 "$UTIL: Failed to get the PID of the container"
+          exit 1
+      fi
+    fi
+    
+    if [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" ]; then
+      
+      create_netns_link
+
+      # Create a veth pair.
+      ID=`uuidgen | sed 's/-//g'`
+      PORTNAME="${ID:0:13}"
+      ip link add "${PORTNAME}_l" type veth peer name "${PORTNAME}_c"
+
+      # Add one end of veth to OVS bridge.
+      if ovs_vsctl --may-exist add-port "$BRIDGE" "${PORTNAME}_l" \
+         -- set interface "${PORTNAME}_l" \
+         external_ids:container_id="$CONTAINER" \
+         external_ids:container_iface="$INTERFACE"; then :; else
+          echo >&2 "$UTIL: Failed to add "${PORTNAME}_l" port to bridge $BRIDGE"
+          ip link delete "${PORTNAME}_l"
+          exit 1
+      fi
+
+      ip link set "${PORTNAME}_l" up
+
+      # Move "${PORTNAME}_c" inside the container and changes its name.
+      ip link set "${PORTNAME}_c" netns "$PID"
+      ip netns exec "$PID" ip link set dev "${PORTNAME}_c" name "$INTERFACE"
+      ip netns exec "$PID" ip link set "$INTERFACE" up
+    
+    else
+      
+      # Get the interface that correspond to the container
+      HOST_INTERFACE=`ip -o link | awk '/if'$(nsenter \
+      --net=$(docker inspect -f '{{.NetworkSettings.SandboxKey}}' $CONTAINER) \
+      ip link | awk '/eth0/ {print $1}' | tr -d ':')'/ {split($2,id,"@");print id[1]}'`
+      
+      if [ $? -ne 0 ]; then
+          echo >&2 "$UTIL: Failed to get the interface on the host" \
+                   "for CONTAINER=$CONTAINER and INTERFACE=$INTERFACE"
+          exit 1
+      fi
+      
+      # Nomaster the interface from the default BRIDGE
+      ip link set down dev "$HOST_INTERFACE"
+      if [ $? -ne 0 ]; then
+          echo >&2 "$UTIL: Failed to modify the status of the interface $HOST_INTERFACE"
+          exit 1
+      fi
+      
+      ip link set nomaster dev "$HOST_INTERFACE"
+      
+      # Add the interface to the OVS BRIDGE
+      if ovs_vsctl --may-exist add-port "$BRIDGE" "$HOST_INTERFACE" \
+         -- set interface "$HOST_INTERFACE" \
+         external_ids:container_id="$CONTAINER" \
+         external_ids:container_iface="$INTERFACE"; then :; else
+          echo >&2 "$UTIL: Failed to add "$HOST_INTERFACE" port to bridge $BRIDGE"
+          exit 1
+      fi
+      
+      ip link set up dev "$HOST_INTERFACE"
+      
+    fi
+    
+    if [ -n "$MTU" ]; then
+        
+      if [ "$RUNTIME" = "kata-runtime" ]; then
+        
+        if docker exec $CONTAINER ip link set dev "$INTERFACE" mtu "$MTU" > /dev/null 2>&1; then :; else
+            echo >&2 "$UTIL: Failed to set the MTU of $INTERFACE in the container"
+            exit 1
+        fi
+      elif [ "$RUNTIME" = "runc"  -o "$RUNTIME" = "singularity"  ]; then
+        ip netns exec "$PID" ip link set dev "$INTERFACE" mtu "$MTU"
+      fi
+      
+    fi
+
+    if [ -n "$ADDRESS" ]; then
+      
+      if [ "$RUNTIME" = "kata-runtime" ]; then
+        
+        if docker exec $CONTAINER ip addr flush dev "$INTERFACE" > /dev/null 2>&1; then :; else
+            echo >&2 "$UTIL: Failed to flush ADDRESS of $INTERFACE in the container"
+            exit 1
+        fi
+        docker exec $CONTAINER ip addr add "$ADDRESS" dev "$INTERFACE"
+        
+      elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" ]; then
+        ip netns exec "$PID" ip addr add "$ADDRESS" dev "$INTERFACE"
+      fi
+      
+    fi
+
+    if [ -n "$MACADDRESS" ]; then
+      
+      if [ "$RUNTIME" = "kata-runtime" ]; then
+        
+        if docker exec $CONTAINER ip link set dev "$INTERFACE" address "$MACADDRESS" > /dev/null 2>&1; then :; else
+            echo >&2 "$UTIL: Failed to set the MACADDRESS of $INTERFACE in the container"
+            exit 1
+        fi
+      elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" ]; then
+        ip netns exec "$PID" ip link set dev "$INTERFACE" address "$MACADDRESS"
+      fi
+      
+    fi
+
+    if [ -n "$GATEWAY" ]; then
+      
+      if [ "$RUNTIME" = "kata-runtime" ]; then
+        
+        if docker exec $CONTAINER ip route add default via "$GATEWAY" > /dev/null 2>&1; then :; else
+            echo >&2 "$UTIL: Failed to set the GATEWAY in the container"
+            exit 1
+        fi
+      elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" ]; then
+        ip netns exec "$PID" ip route add default via "$GATEWAY"
+      fi
+      
+    fi
+    
+    if [ -n "$DNS" ]; then
+      
+      if [ "$RUNTIME" = "kata-runtime" -o "$RUNTIME" = "runc" ]; then
+        
+          if docker exec $CONTAINER bash -c "echo nameserver $DNS > /etc/resolv.conf";then :; else
+              echo >&2 "$UTIL: Failed to set the DNS in the container"
+              exit 1
+          fi
+      elif [ "$RUNTIME" = "singularity" ]; then
+        
+          if singularity exec instance://${CONTAINER} bash -c "echo nameserver $DNS > /etc/resolv.conf";\
+          then :; else
+              echo >&2 "$UTIL: Failed to set the DNS in the container"
+              exit 1
+          fi
+      fi
+      
+    fi
+    
+    if [ -z "$ADDRESS" -a "$DHCP" ]; then
+      
+      if [ "$RUNTIME" = "kata-runtime" ]; then
+        
+        if docker exec $CONTAINER ip addr flush dev "$INTERFACE" > /dev/null 2>&1; then :; else
+            echo >&2 "$UTIL: Failed to flush ADDRESS of $INTERFACE in the container"
+            exit 1
+        fi
+        
+      fi
+      
+      if [ "$RUNTIME" = "kata-runtime" -o "$RUNTIME" = "runc" ]; then
+        
+        if FILE=`docker exec $CONTAINER dhclient "$INTERFACE" 2>&1 | awk '{print $4}' | tail -1 | tr -d ''"'"''`; then :; else
+            echo >&2 "$UTIL: Failed to get ADDRESS from DHCP of $INTERFACE in the container"
+            exit 1
+        fi
+        
+        if docker exec $CONTAINER ls $FILE > /dev/null 2>&1; then :; else
+            echo >&2 "$UTIL: Failed to set DNS of $INTERFACE in the container"
+            exit 1
+        fi
+        
+        docker exec $CONTAINER bash -c "cat $FILE > /etc/resolv.conf"
+        
+      fi
+      
+      if [ "$RUNTIME" = "singularity" ]; then
+        
+        if FILE=`singularity exec instance://${CONTAINER} dhclient "$INTERFACE" 2>&1 | awk '{print $4}' | tail -1 | tr -d ''"'"''`; then :; else
+            echo >&2 "$UTIL: Failed to get ADDRESS from DHCP of $INTERFACE in the container"
+            exit 1
+        fi
+        
+        if singularity exec instance://${CONTAINER} ls $FILE > /dev/null 2>&1; then :; else
+            echo >&2 "$UTIL: Failed to set DNS of $INTERFACE in the container"
+            exit 1
+        fi
+        
+        singularity exec instance://${CONTAINER} bash -c "cat $FILE > /etc/resolv.conf"
+        
+      fi
+      
+    fi
+
+}
+
+del_port () {
+    BRIDGE="$1"
+    INTERFACE="$2"
+    CONTAINER="$3"
+    USER=`expr X"$4" : 'X[^=]*=\(.*\)'`
+
+    if [ "$#" -lt 3 ]; then
+        usage
+        exit 1
+    fi
+
+    if RUNTIME=`get_runtime "$CONTAINER" "$USER"`; then :; else
+      exit 1
+    fi
+    
+    PORT=`get_port_for_container_interface "$CONTAINER" "$INTERFACE"`
+    if [ -z "$PORT" ]; then
+        exit 1
+    fi
+
+    ovs_vsctl --if-exists del-port "$PORT"
+    
+    if [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" ]; then
+      ip link delete "$PORT"
+    else
+      ip link set nomaster dev "$PORT"
+    fi
+    
+}
+
+del_ports () {
+    BRIDGE="$1"
+    CONTAINER="$2"
+    USER=`expr X"$3" : 'X[^=]*=\(.*\)'`
+    
+    if [ "$#" -lt 2 ]; then
+        usage
+        exit 1
+    fi
+
+    if RUNTIME=`get_runtime "$CONTAINER" "$USER"`; then :; else
+      exit 1
+    fi
+    
+    PORTS=`ovs_vsctl --data=bare --no-heading --columns=name find interface \
+             external_ids:container_id="$CONTAINER"`
+    if [ -z "$PORTS" ]; then
+        exit 0
+    fi
+    
+    for PORT in $PORTS; do
+        ovs_vsctl --if-exists del-port "$PORT"
+        
+        if [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" ]; then
+          ip link delete "$PORT"
+        else
+          ip link set nomaster dev "$PORT"
+        fi
+        
+    done
+}
+
+set_vlan () {
+    BRIDGE="$1"
+    INTERFACE="$2"
+    CONTAINER_ID="$3"
+    VLAN="$4"
+
+    if [ "$#" -lt 4 ]; then
+        usage
+        exit 1
+    fi
+
+    PORT=`get_port_for_container_interface "$CONTAINER_ID" "$INTERFACE"`
+    if [ -z "$PORT" ]; then
+        exit 1
+    fi
+    ovs_vsctl set port "$PORT" tag="$VLAN"
+}
+
+flush () {
+  BRIDGE="$1"
+  
+  if [ "$#" -lt 1 ]; then
+      usage
+      exit 1
+  fi
+  
+  if ovs-vsctl list bridge $BRIDGE > /dev/null 2>&1; then :; else
+    echo >&2 "$UTIL: Failed to get ports from $BRIDGE"
+    exit 1
+  fi
+  
+  for PORT in `ovs-vsctl --columns=ports --format=table --data=bare --no-headings list bridge $BRIDGE`
+  do
+    for NAME in `ovs-vsctl --columns=_uuid,name --format=csv --data=bare --no-headings list port`
+    do
+      
+      PORT_UUID=`echo $NAME | cut -d ',' -f 1`
+      PORT_NAME=`echo $NAME | cut -d ',' -f 2`
+      
+      if [ "$PORT" == "$PORT_UUID" ]; then
+        
+        if ovs-vsctl --columns=error --format=csv --data=bare --no-headings list interface $PORT_NAME | grep "No such device" > /dev/null; then
+          ovs-vsctl del-port $BRIDGE $PORT_NAME
+        fi
+      fi
+    done  
+  done
+  
+}
+
+usage() {
+    cat << EOF
+${UTIL}: Performs integration of Open vSwitch with Docker/Kata-container/Gvisor/Singularity.
+usage: ${UTIL} COMMAND
+
+Commands:
+  add-port BRIDGE INTERFACE CONTAINER [--user=USER] [--ipaddress="ADDRESS"]
+                    [--gateway=GATEWAY] [--dns=DNS] [--macaddress="MACADDRESS"]
+                    [--mtu=MTU] [--dhcp]
+                    Adds INTERFACE inside CONTAINER and connects it as a port
+                    in Open vSwitch BRIDGE. Optionally, sets ADDRESS on
+                    INTERFACE. ADDRESS can include a '/' to represent network
+                    prefix length. Optionally, sets a GATEWAY, MACADDRESS
+                    and MTU. For DHCP, it requires the capability CAP_NET_ADMIN
+                    end the dhclient binary into the container. For singularity,
+                    it requires the user who launch the container.
+                     e.g.:
+                    ${UTIL} add-port br-int eth1 c474a0e2830e
+                    --ipaddress=192.168.1.2/24 --gateway=192.168.1.1
+                    --macaddress="a2:c3:0d:49:7f:f8" --mtu=1450
+  del-port BRIDGE INTERFACE CONTAINER [USER]
+                    Deletes INTERFACE inside CONTAINER and removes its
+                    connection to Open vSwitch BRIDGE. e.g.:
+                    ${UTIL} del-port br-int eth1 c474a0e2830e
+  del-ports BRIDGE CONTAINER [USER]
+                    Removes all Open vSwitch interfaces from CONTAINER. e.g.:
+                    ${UTIL} del-ports br-int c474a0e2830e
+  set-vlan BRIDGE INTERFACE CONTAINER VLAN
+                    Configures the INTERFACE of CONTAINER attached to BRIDGE
+                    to become an access port of VLAN. e.g.:
+                    ${UTIL} set-vlan br-int eth1 c474a0e2830e 5
+  flush-ports BRIDGE
+                    Delete ports where the interface on the host is deleted.
+                    ${UTIL} flush-ports br-int
+Options:
+  -h, --help        display this help message.
+EOF
+}
+
+UTIL=$(basename $0)
+if search_path ovs-vsctl > /dev/null; then :; else
+  echo >&2 "$UTIL: ovs-vsctl not found in \$PATH, please install and try again"
+  exit 1
+fi
+
+if search_path uuidgen > /dev/null; then :; else
+  echo >&2 "$UTIL: uuidgen not found in \$PATH, please install and try again"
+  exit 1
+fi
+
+if (ip netns) > /dev/null 2>&1; then :; else
+    echo >&2 "$UTIL: ip utility not found (or it does not support netns),"\
+             "cannot proceed"
+    exit 1
+fi
+
+if [ $# -eq 0 ]; then
+    usage
+    exit 0
+fi
+
+case $1 in
+    "add-port")
+        shift
+        add_port "$@"
+        exit 0
+        ;;
+    "del-port")
+        shift
+        del_port "$@"
+        exit 0
+        ;;
+    "del-ports")
+        shift
+        del_ports "$@"
+        exit 0
+        ;;
+    "set-vlan")
+        shift
+        set_vlan "$@"
+        exit 0
+        ;;
+    "flush-ports")
+        shift
+        flush "$@"
+        exit 0
+        ;;
+    -h | --help)
+        usage
+        exit 0
+        ;;
+    *)
+        echo >&2 "$UTIL: unknown command \"$1\" (use --help for help)"
+        exit 1
+        ;;
+esac
