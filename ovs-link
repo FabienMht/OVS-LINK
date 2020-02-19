@@ -177,6 +177,37 @@ delete_ebtables_rules () {
   
 }
 
+set_arp_guard () {
+    RUNTIME="$1"
+    CONTAINER="$2"
+    INTERFACE="$3"
+    HOST_INTERFACE="$4"
+    
+    MAC=`get_mac_address $RUNTIME $CONTAINER $INTERFACE`
+    IP=`get_ip_address $RUNTIME $CONTAINER $INTERFACE`
+    
+    ebtables -t filter -A INPUT -s ! $MAC -i $HOST_INTERFACE -j DROP
+    ebtables -t filter -A INPUT -p ARP -i $HOST_INTERFACE --arp-mac-src ! $MAC -j DROP
+    ebtables -t filter -A INPUT -p ARP -i $HOST_INTERFACE --arp-ip-src ! $IP -j DROP
+    
+}
+
+set_ip_guard () {
+    RUNTIME="$1"
+    CONTAINER="$2"
+    INTERFACE="$3"
+    HOST_INTERFACE="$4"
+    
+    MAC=`get_mac_address $RUNTIME $CONTAINER $INTERFACE`
+    IP=`get_ip_address $RUNTIME $CONTAINER $INTERFACE`
+    
+    ebtables -t filter -A INPUT -p IPv4 -s $MAC -i $HOST_INTERFACE --ip-src 0.0.0.0 --ip-dst 255.255.255.255 --ip-proto udp --ip-dport 67 -j ACCEPT
+    ebtables -t filter -A INPUT -p IPv4 -i $HOST_INTERFACE --ip-src ! $IP -j DROP
+    ebtables -t filter -A FORWARD -p IPv4 -i $HOST_INTERFACE --ip-src ! $IP -j DROP
+    
+}
+
+
 add_port () {
     BRIDGE="$1"
     INTERFACE="$2"
@@ -488,21 +519,12 @@ add_port () {
 
     fi
     
-    if [ -n "$ARPGUARD" -o -n "$IPGUARD" ]; then
-        MAC=`get_mac_address $RUNTIME $CONTAINER $INTERFACE`
-        IP=`get_ip_address $RUNTIME $CONTAINER $INTERFACE`
-    fi
-    
     if [ -n "$ARPGUARD" ]; then
-      ebtables -t filter -A INPUT -s ! $MAC -i $HOST_INTERFACE -j DROP
-      ebtables -t filter -A INPUT -p ARP -i $HOST_INTERFACE --arp-mac-src ! $MAC -j DROP
-      ebtables -t filter -A INPUT -p ARP -i $HOST_INTERFACE --arp-ip-src ! $IP -j DROP
+        set_arp_guard "$RUNTIME" "$CONTAINER" "$INTERFACE" "$HOST_INTERFACE"
     fi
     
     if [ -n "$IPGUARD" ]; then
-      ebtables -t filter -A INPUT -p IPv4 -s $MAC -i $HOST_INTERFACE --ip-src 0.0.0.0 --ip-dst 255.255.255.255 --ip-proto udp --ip-dport 67 -j ACCEPT
-      ebtables -t filter -A INPUT -p IPv4 -i $HOST_INTERFACE --ip-src ! $IP -j DROP
-      ebtables -t filter -A FORWARD -p IPv4 -i $HOST_INTERFACE --ip-src ! $IP -j DROP
+        set_ip_guard "$RUNTIME" "$CONTAINER" "$INTERFACE" "$HOST_INTERFACE"
     fi
 
 }
