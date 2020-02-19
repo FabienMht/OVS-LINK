@@ -124,6 +124,59 @@ get_pid () {
   echo $PID
 }
 
+get_mac_address () {
+  RUNTIME="$1"
+  CONTAINER="$2"
+  INTERFACE="$3"
+  
+  if [ "$RUNTIME" = "kata-runtime" ]; then
+    
+    if MAC=`docker exec $CONTAINER  ip addr show $INTERFACE | awk '/link\/ether/ {print $2}'`; then :; else
+        echo >&2 "$UTIL: Failed to get IP Address of $INTERFACE in the container"
+        exit 1
+    fi
+    
+  elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
+    MAC=`ip netns exec "$CONTAINER" ip addr show $INTERFACE | awk '/link\/ether/ {print $2}'`
+  fi
+  
+  echo $MAC  
+}
+
+get_ip_address () {
+  RUNTIME="$1"
+  CONTAINER="$2"
+  INTERFACE="$3"
+  
+  if [ "$RUNTIME" = "kata-runtime" ]; then
+    
+    if IP=`docker exec $CONTAINER ip -o -4 addr show $INTERFACE | \
+    awk '{split($4,ip,"/");print ip[1]}'`; then :; else
+        echo >&2 "$UTIL: Failed to get IP Address of $INTERFACE in the container"
+        exit 1
+    fi
+    
+  elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
+    IP=`ip netns exec "$CONTAINER" ip -o -4 addr show $INTERFACE | awk '{split($4,ip,"/");print ip[1]}'`
+  fi
+  
+  echo $IP  
+}
+
+delete_ebtables_rules () {
+  PORT="$1"
+  
+  for CHAIN in "INPUT" "FORWARD"; do
+    RULE_NUMBER_LOW=`ebtables -t filter -L $CHAIN --Ln | awk '/'$PORT'/ {print $1}' | tr -d '.' | head -n 1`
+    RULE_NUMBER_HIGH=`ebtables -t filter -L $CHAIN --Ln | awk '/'$PORT'/ {print $1}' | tr -d '.' | tail -n 1`
+    
+    if [ -n "$RULE_NUMBER_LOW" -a -n "$RULE_NUMBER_HIGH" ]; then
+      ebtables -t filter -D $CHAIN ${RULE_NUMBER_LOW}:${RULE_NUMBER_HIGH}
+    fi
+  done
+  
+}
+
 add_port () {
     BRIDGE="$1"
     INTERFACE="$2"
@@ -434,6 +487,22 @@ add_port () {
       fi
 
     fi
+    
+    if [ -n "$ARPGUARD" ]; then
+      
+      if [ "$RUNTIME" = "kata-runtime" ]; then
+        MAC=`get_mac_address $RUNTIME $CONTAINER $INTERFACE`
+        IP=`get_ip_address $RUNTIME $CONTAINER $INTERFACE`
+      elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
+        MAC=`get_mac_address $RUNTIME $PID $INTERFACE`
+        IP=`get_ip_address $RUNTIME $PID $INTERFACE`
+      fi
+      
+      ebtables -t filter -A INPUT -s ! $MAC -i $HOST_INTERFACE -j DROP 
+      ebtables -t filter -A INPUT -p ARP -i $HOST_INTERFACE --arp-mac-src ! $MAC -j DROP 
+      ebtables -t filter -A INPUT -p ARP -i $HOST_INTERFACE --arp-ip-src ! $IP -j DROP
+
+    fi
 
 }
 
@@ -465,6 +534,8 @@ del_port () {
       ip link set nomaster dev "$PORT"
     fi
     
+    delete_ebtables_rules "$PORT"
+    
 }
 
 del_ports () {
@@ -495,6 +566,8 @@ del_ports () {
         else
           ip link set nomaster dev "$PORT"
         fi
+        
+        delete_ebtables_rules "$PORT"
         
     done
 }
@@ -543,6 +616,8 @@ flush () {
         if ovs_vsctl --columns=error --format=csv --data=bare --no-headings list interface $PORT_NAME | \
         grep "No such device" > /dev/null; then
           ovs_vsctl del-port $BRIDGE $PORT_NAME
+          
+          delete_ebtables_rules "$PORT_NAME"
         fi
       fi
     done  
