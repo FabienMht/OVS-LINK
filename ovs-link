@@ -181,7 +181,7 @@ add_port () {
     BRIDGE="$1"
     INTERFACE="$2"
     CONTAINER="$3"
-    USER=""
+    USER="root"
 
     if [ -z "$BRIDGE" ] || [ -z "$INTERFACE" ] || [ -z "$CONTAINER" ]; then
         echo >&2 "$UTIL add-port: not enough arguments (use --help for help)"
@@ -466,7 +466,7 @@ add_port () {
       
       if [ "$RUNTIME" = "lxc" ]; then
         
-          if sudo -i -u $USER -- lxc-attach --name=$CONTAINER dhclient $INTERFACE;\
+          if sudo -i -u $USER -- lxc-attach --name=$CONTAINER dhclient $INTERFACE 2>/dev/null;\
           then :; else
               echo >&2 "$UTIL: Failed to set the DNS in the container"
               exit 1
@@ -518,7 +518,11 @@ del_port () {
     BRIDGE="$1"
     INTERFACE="$2"
     CONTAINER="$3"
-    USER=`expr X"$4" : 'X[^=]*=\(.*\)'`
+    if [ -n "$4" ]; then
+      USER=`expr X"$4" : 'X[^=]*=\(.*\)'`
+    else
+      USER="root"
+    fi
 
     if [ "$#" -lt 3 ]; then
         usage
@@ -549,7 +553,11 @@ del_port () {
 del_ports () {
     BRIDGE="$1"
     CONTAINER="$2"
-    USER=`expr X"$3" : 'X[^=]*=\(.*\)'`
+    if [ -n "$3" ]; then
+      USER=`expr X"$3" : 'X[^=]*=\(.*\)'`
+    else
+      USER="root"
+    fi
     
     if [ "$#" -lt 2 ]; then
         usage
@@ -646,11 +654,12 @@ Commands:
                     Adds INTERFACE inside CONTAINER and connects it as a port
                     in Open vSwitch BRIDGE. Optionally, sets ADDRESS on
                     INTERFACE. ADDRESS can include a '/' to represent network
-                    prefix length. Optionally, sets a GATEWAY, MACADDRESS
-                    and MTU. For DHCP, it requires the capability CAP_NET_ADMIN
-                    end the dhclient binary into the container. For singularity,
-                    it requires the user who launch the container.
-                     e.g.:
+                    prefix length. Optionally, sets a GATEWAY, MACADDRESS, MTU,
+                    DHCP, IPGUARD, ARPGUARD and an ingress limit to interface.
+                    For DHCP, it requires the capability CAP_NET_ADMIN
+                    end the dhclient binary into the container.
+                    For singularity and lxc, it requires the user who launch 
+                    the container. e.g.:
                     ${UTIL} add-port br-int eth1 c474a0e2830e
                     --ipaddress=192.168.1.2/24 --gateway=192.168.1.1
                     --macaddress="a2:c3:0d:49:7f:f8" --mtu=1450
