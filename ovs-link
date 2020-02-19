@@ -23,8 +23,8 @@ ovs_vsctl () {
 
 create_netns_link () {
     mkdir -p /var/run/netns
-    if [ ! -e /var/run/netns/"$CONTAINER" ]; then
-        ln -s /proc/"$CONTAINER"/ns/net /var/run/netns/"$CONTAINER"
+    if [ ! -e /var/run/netns/"$PID" ]; then
+        ln -s /proc/"$PID"/ns/net /var/run/netns/"$PID"
         trap 'delete_netns_link' 0
         for signal in 1 2 3 13 14 15; do
             trap 'delete_netns_link; trap - $signal; kill -$signal $$' $signal
@@ -33,7 +33,7 @@ create_netns_link () {
 }
 
 delete_netns_link () {
-    rm -f /var/run/netns/"$CONTAINER"
+    rm -f /var/run/netns/"$PID"
 }
 
 get_port_for_container_interface () {
@@ -177,6 +177,21 @@ delete_ebtables_rules () {
   
 }
 
+set_limit_bandwith_interface () {
+    HOST_INTERFACE="$1"
+    LIMITIN="$2"
+  
+    if ovs_vsctl set interface $HOST_INTERFACE ingress_policing_rate=$LIMITIN;then :;else
+        echo >&2 "$UTIL: Failed to set ingress limit to INTERFACE=$HOST_INTERFACE"
+        exit 1
+    fi
+    if ovs_vsctl set interface $HOST_INTERFACE ingress_policing_burst=$LIMITIN;then :;else
+        echo >&2 "$UTIL: Failed to set ingress limit to INTERFACE=$HOST_INTERFACE"
+        exit 1
+    fi
+    
+}
+
 set_arp_guard () {
     RUNTIME="$1"
     CONTAINER="$2"
@@ -206,7 +221,6 @@ set_ip_guard () {
     ebtables -t filter -A FORWARD -p IPv4 -i $HOST_INTERFACE --ip-src ! $IP -j DROP
     
 }
-
 
 add_port () {
     BRIDGE="$1"
@@ -288,16 +302,16 @@ add_port () {
         exit 1
     fi
     
+    if PID=`get_pid "$RUNTIME" "$CONTAINER" "$USER"`;then :; else
+      exit 1
+    fi
+    
     if [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
-      
-      if CONTAINER=`get_pid "$RUNTIME" "$CONTAINER" "$USER"`;then :; else
-        exit 1
-      fi
       
       create_netns_link
       
       # chack if interface exists inside the container
-      if ip netns exec "$CONTAINER" ip link | grep "$INTERFACE" >/dev/null;then
+      if ip netns exec "$PID" ip link | grep "$INTERFACE" >/dev/null;then
         echo >&2 "$UTIL: INTERFACE=$INTERFACE exists in CONTAINER=$CONTAINER"
         exit 1
       fi
@@ -321,9 +335,9 @@ add_port () {
       ip link set "${PORTNAME}_l" up
 
       # Move "${PORTNAME}_c" inside the container and changes its name.
-      ip link set "${PORTNAME}_c" netns "$CONTAINER"
-      ip netns exec "$CONTAINER" ip link set dev "${PORTNAME}_c" name "$INTERFACE"
-      ip netns exec "$CONTAINER" ip link set "$INTERFACE" up
+      ip link set "${PORTNAME}_c" netns "$PID"
+      ip netns exec "$PID" ip link set dev "${PORTNAME}_c" name "$INTERFACE"
+      ip netns exec "$PID" ip link set "$INTERFACE" up
     
     else
       
@@ -369,7 +383,7 @@ add_port () {
             exit 1
         fi
       elif [ "$RUNTIME" = "runc"  -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc"  ]; then
-        ip netns exec "$CONTAINER" ip link set dev "$INTERFACE" mtu "$MTU"
+        ip netns exec "$PID" ip link set dev "$INTERFACE" mtu "$MTU"
       fi
       
     fi
@@ -385,7 +399,7 @@ add_port () {
         docker exec $CONTAINER ip addr add "$ADDRESS" dev "$INTERFACE"
         
       elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
-        ip netns exec "$CONTAINER" ip addr add "$ADDRESS" dev "$INTERFACE"
+        ip netns exec "$PID" ip addr add "$ADDRESS" dev "$INTERFACE"
       fi
       
     fi
@@ -399,7 +413,7 @@ add_port () {
             exit 1
         fi
       elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
-        ip netns exec "$CONTAINER" ip link set dev "$INTERFACE" address "$MACADDRESS"
+        ip netns exec "$PID" ip link set dev "$INTERFACE" address "$MACADDRESS"
       fi
       
     fi
@@ -418,8 +432,8 @@ add_port () {
             exit 1
         fi
       elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
-        ip netns exec "$CONTAINER" ip route delete default
-        ip netns exec "$CONTAINER" ip route add default via "$GATEWAY"
+        ip netns exec "$PID" ip route delete default
+        ip netns exec "$PID" ip route add default via "$GATEWAY"
       fi
       
     fi
@@ -507,24 +521,34 @@ add_port () {
     fi
     
     if [ -n "$LIMITIN" ]; then
-      
-      if ovs_vsctl set interface $HOST_INTERFACE ingress_policing_rate=$LIMITIN;then :;else
-          echo >&2 "$UTIL: Failed to set ingress limit to INTERFACE=$HOST_INTERFACE"
-          exit 1
+        if set_limit_interface "$HOST_INTERFACE" "$LIMITIN"; then :; else
+            exit 1
+        fi
+    fi
+
+    if [ -n "$ARPGUARD" ]; then
+      if [ "$RUNTIME" = "kata-runtime" ]; then
+          if set_arp_guard "$RUNTIME" "$CONTAINER" "$INTERFACE" "$HOST_INTERFACE"; then :; else
+              exit 1
+          fi
+      elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
+          if set_arp_guard "$RUNTIME" "$PID" "$INTERFACE" "$HOST_INTERFACE"; then :; else
+              exit 1
+          fi
       fi
-      if ovs_vsctl set interface $HOST_INTERFACE ingress_policing_burst=$LIMITIN;then :;else
-          echo >&2 "$UTIL: Failed to set ingress limit to INTERFACE=$HOST_INTERFACE"
-          exit 1
+    fi
+
+    if [ -n "$IPGUARD" ]; then
+      if [ "$RUNTIME" = "kata-runtime" ]; then
+          if set_ip_guard "$RUNTIME" "$CONTAINER" "$INTERFACE" "$HOST_INTERFACE"; then :; else
+              exit 1
+          fi
+      elif [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
+          if set_ip_guard "$RUNTIME" "$PID" "$INTERFACE" "$HOST_INTERFACE"; then :; else
+              exit 1
+          fi
       fi
 
-    fi
-    
-    if [ -n "$ARPGUARD" ]; then
-        set_arp_guard "$RUNTIME" "$CONTAINER" "$INTERFACE" "$HOST_INTERFACE"
-    fi
-    
-    if [ -n "$IPGUARD" ]; then
-        set_ip_guard "$RUNTIME" "$CONTAINER" "$INTERFACE" "$HOST_INTERFACE"
     fi
 
 }
