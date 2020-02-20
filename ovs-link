@@ -1054,11 +1054,6 @@ case $1 in
         del_ports "$@"
         exit 0
         ;;
-    "set-vlan")
-        shift
-        set_vlan "$@"
-        exit 0
-        ;;
     "flush-ports")
         shift
         flush "$@"
