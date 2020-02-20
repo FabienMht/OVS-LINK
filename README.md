@@ -22,7 +22,7 @@ Performs integration of Open vSwitch with Docker/Kata-containers/Gvisor/Singular
 - DHCP : cap_net_admin
 
 **Solutions needed :**
-- ALL : openvswitch
+- ALL : openvswitch, iproute2
 - DHCP : dhclient in container
 - ARP and IP spoofing : ebtables
 
@@ -64,5 +64,5 @@ flush-ports BRIDGE
 **Add an interface to ovs bridge with arp and ip spoofing prevention and bandwith limit :**  
 `sudo ovs-link add-port bridge interface container --limitin=1000000 --arpguard --ipguard`
 
-**Deletes ports where the interface on the host is deleted :**
+**Deletes ports where the interface on the host is deleted :**  
 `sudo ovs-link flush-ports bridge`
