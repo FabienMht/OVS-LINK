@@ -62,9 +62,7 @@ get_runtime () {
     if [ "$DOCKER" = "0" ]; then
       for ID in `docker ps -q`; do
         if [ "$ID" = "$CONTAINER" ]; then
-          if RUNTIME=`docker inspect -f '{{.HostConfig.Runtime}}' "$CONTAINER" 2>/dev/null`; then 
-            echo $RUNTIME
-            exit 0
+          if RUNTIME=`docker inspect -f '{{.HostConfig.Runtime}}' "$CONTAINER" 2>/dev/null`; then :;
           fi
         fi
       done
@@ -74,8 +72,6 @@ get_runtime () {
       SINGULARITY_LIST=`singularity instance list -u "$USER" "$CONTAINER" 2>/dev/null | wc -l`
       if [ $SINGULARITY_LIST = 2 ]; then
         RUNTIME="singularity"
-        echo $RUNTIME
-        exit 0
       fi
     fi
     
@@ -83,14 +79,15 @@ get_runtime () {
       if STATE=`sudo -i -u $USER lxc-info --state --name="$CONTAINER" 2>/dev/null | awk '{print $2}'`;then
         if [ "$STATE" = "RUNNING" ]; then
           RUNTIME="lxc"
-          echo $RUNTIME
-          exit 0
         fi
       fi
     fi
     
-    echo >&2 "$UTIL Failed to get container RUNTIME for CONTAINER=$CONTAINER"
-    exit 1
+    if [ "$RUNTIME" = "runc" -o "$RUNTIME" = "gvisor" -o "$RUNTIME" = "kata-runtime"\
+     -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then echo $RUNTIME; exit 0; else
+     echo >&2 "$UTIL Failed to get container RUNTIME for CONTAINER=$CONTAINER"
+     exit 1
+   fi
   
 }
 
@@ -157,6 +154,10 @@ delete_ebtables_rules () {
   local PORT="$1"
   local ARPGUARD="$2"
   local IPGUARD="$3"
+  
+  if search_path ebtables > /dev/null; then :; else
+    exit 1
+  fi
   
   for CHAIN in "INPUT" "FORWARD"; do
     if [ "$ARPGUARD" = "1" -a "$IPGUARD" = "0" ]; then
@@ -347,7 +348,7 @@ set_dhcp () {
 
     if sudo -i -u $USER -- lxc-attach --name=$CONTAINER dhclient $INTERFACE 2>/dev/null;\
     then :; else
-        echo >&2 "$UTIL: Failed to set the DNS in the container"
+        echo >&2 "$UTIL: Failed to set the DHCP in the container"
         exit 1
     fi
   fi
@@ -580,6 +581,13 @@ add_port () {
       
     fi
     
+    if [ -n "$ARPGUARD" -o -n "$IPGUARD" ]; then
+      if search_path ebtables > /dev/null; then :; else
+        echo >&2 "$UTIL: ebtables not found in \$PATH, please install and try again"
+        exit 1
+      fi
+    fi
+    
     if [ -n "$MTU" ]; then
       if set_mtu "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$MTU"; then :; else
           exit 1
@@ -734,6 +742,13 @@ set_port () {
       fi
     else
       CONTAINER_ID=$CONTAINER_NAME
+    fi
+    
+    if [ -n "$ARPGUARD" -o -n "$IPGUARD" ]; then
+      if search_path ebtables > /dev/null; then :; else
+        echo >&2 "$UTIL: ebtables not found in \$PATH, please install and try again"
+        exit 1
+      fi
     fi
     
     if [ -n "$MTU" ]; then
