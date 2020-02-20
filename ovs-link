@@ -312,7 +312,7 @@ clean_dhclient () {
   
   if [ "$RUNTIME" = "kata-runtime" -o "$RUNTIME" = "runc" ]; then
     DHCLIENT=`docker exec $CONTAINER pgrep -f "dhclient $INTERFACE"`
-    docker exec $CONTAINER kill $DHCLIENT 2>/dev/null
+    docker exec $CONTAINER bash -c "kill $DHCLIENT 2>/dev/null"
   fi
   
   if [ "$RUNTIME" = "singularity" ]; then
@@ -341,8 +341,9 @@ set_dhcp () {
         echo >&2 "$UTIL: Failed to flush ADDRESS of $INTERFACE in the container"
         exit 1
     fi
-    if FILE=`docker exec $CONTAINER dhclient "$INTERFACE" 2>&1 | awk '{print $4}' \
-    | tail -1 | tr -d ''"'"''`; then :; else
+    FILE=`docker exec $CONTAINER bash -c "dhclient "$INTERFACE"" 2>&1 | \
+    awk '$0!~/command not found/ {print $4}' | tail -1 | tr -d ''"'"''`
+    if [ "$FILE" = "" ]; then
         echo >&2 "$UTIL: Failed to get ADDRESS from DHCP of $INTERFACE in the container"
         exit 1
     fi
@@ -355,8 +356,9 @@ set_dhcp () {
   
   if [ "$RUNTIME" = "singularity" ]; then
     
-    if FILE=`singularity exec instance://${CONTAINER} dhclient "$INTERFACE" 2>&1 | awk \
-    '{print $4}' | tail -1 | tr -d ''"'"''`; then :; else
+    FILE=`singularity exec instance://${CONTAINER} bash -c "dhclient "$INTERFACE"" 2>&1 | awk \
+    '$0!~/command not found/ {print $4}' | tail -1 | tr -d ''"'"''`
+    if [ "$FILE" = "" ]; then
         echo >&2 "$UTIL: Failed to get ADDRESS from DHCP of $INTERFACE in the container"
         exit 1
     fi
