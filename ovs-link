@@ -178,6 +178,29 @@ delete_ebtables_rules () {
   
 }
 
+check_ebtables_rules () {
+  local PORT="$1"
+  local ARPGUARD="$2"
+  local IPGUARD="$3"
+  
+  for CHAIN in "INPUT" "FORWARD"; do
+    if [ "$ARPGUARD" = "1" -a "$IPGUARD" = "0" ]; then
+      RULE=`ebtables -t filter -L $CHAIN --Ln | awk '/'$PORT'/ && $0!~/IPv4/ {print $1}' | tr -d '.' | head -n 1`
+      if [ "$RULE" != "" ];then 
+        echo >&2 "$UTIL: ebtables rules already exists for INTERFACE=$PORT"
+        exit 1
+      fi
+    elif [ "$ARPGUARD" = "0" -a "$IPGUARD" = "1" ]; then
+      RULE=`ebtables -t filter -L $CHAIN --Ln | awk '/'$PORT'/ && $0~/IPv4/ {print $1}' | tr -d '.' | head -n 1`
+      if [ "$RULE" != "" ];then 
+        echo >&2 "$UTIL: ebtables rules already exists for INTERFACE=$PORT"
+        exit 1
+      fi
+    fi
+  done
+  
+}
+
 set_ip_address () {
   local RUNTIME="$1"
   local CONTAINER="$2"
@@ -394,12 +417,18 @@ set_arp_guard () {
   local INTERFACE="$3"
   local HOST_INTERFACE="$4"
   
+  
+  if check_ebtables_rules "$HOST_INTERFACE" "1" "0";then :; else
+    echo ok
+    exit 1
+  fi
+  
   MAC=`get_mac_address $RUNTIME $CONTAINER $INTERFACE`
   IP=`get_ip_address $RUNTIME $CONTAINER $INTERFACE`
   
   if ebtables -t filter -A INPUT -s ! $MAC -i $HOST_INTERFACE -j DROP 2>/dev/null;then :;else
-      echo >&2 "$UTIL: Failed to set ARPGUARD to INTERFACE=$HOST_INTERFACE"
-      exit 1
+    echo >&2 "$UTIL: Failed to set ARPGUARD to INTERFACE=$HOST_INTERFACE"
+    exit 1
   fi
   ebtables -t filter -A INPUT -p ARP -i $HOST_INTERFACE --arp-mac-src ! $MAC -j DROP 2>/dev/null
   ebtables -t filter -A INPUT -p ARP -i $HOST_INTERFACE --arp-ip-src ! $IP -j DROP 2>/dev/null
@@ -412,13 +441,17 @@ set_ip_guard () {
   local INTERFACE="$3"
   local HOST_INTERFACE="$4"
   
+  if check_ebtables_rules "$HOST_INTERFACE" "0" "1";then :; else
+    exit 1
+  fi
+  
   MAC=`get_mac_address $RUNTIME $CONTAINER $INTERFACE`
   IP=`get_ip_address $RUNTIME $CONTAINER $INTERFACE`
   
   if ebtables -t filter -A INPUT -p IPv4 -s $MAC -i $HOST_INTERFACE --ip-src 0.0.0.0 \
   --ip-dst 255.255.255.255 --ip-proto udp --ip-dport 67 -j ACCEPT 2>/dev/null;then :;else
-  echo >&2 "$UTIL: Failed to set IPPGUARD to INTERFACE=$HOST_INTERFACE"
-  exit 1
+    echo >&2 "$UTIL: Failed to set IPPGUARD to INTERFACE=$HOST_INTERFACE"
+    exit 1
   fi
   ebtables -t filter -A INPUT -p IPv4 -i $HOST_INTERFACE --ip-src ! $IP -j DROP 2>/dev/null
   ebtables -t filter -A FORWARD -p IPv4 -i $HOST_INTERFACE --ip-src ! $IP -j DROP 2>/dev/null
@@ -969,7 +1002,7 @@ Commands:
                     Removes all Open vSwitch interfaces from CONTAINER. e.g.:
                     ${UTIL} del-ports br-int c474a0e2830e
   flush-ports BRIDGE
-                    Delete ports where the interface on the host is deleted.
+                    Deletes ports where the interface on the host is deleted.
                     ${UTIL} flush-ports br-int
 Options:
   -h, --help        display this help message.
