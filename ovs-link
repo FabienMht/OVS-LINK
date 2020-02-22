@@ -428,12 +428,14 @@ set_arp_guard () {
   MAC=`get_mac_address $RUNTIME $CONTAINER $INTERFACE`
   IP=`get_ip_address $RUNTIME $CONTAINER $INTERFACE`
   
-  if ebtables -t filter -A INPUT -s ! $MAC -i $HOST_INTERFACE -j DROP 2>/dev/null;then :;else
-    echo >&2 "$UTIL: Failed to set ARPGUARD to INTERFACE=$HOST_INTERFACE"
-    exit 1
-  fi
-  ebtables -t filter -A INPUT -p ARP -i $HOST_INTERFACE --arp-mac-src ! $MAC -j DROP 2>/dev/null
-  ebtables -t filter -A INPUT -p ARP -i $HOST_INTERFACE --arp-ip-src ! $IP -j DROP 2>/dev/null
+  for CHAIN in "INPUT" "FORWARD"; do
+    if ebtables -t filter -A $CHAIN -s ! $MAC -i $HOST_INTERFACE -j DROP 2>/dev/null;then :;else
+      echo >&2 "$UTIL: Failed to set ARPGUARD to INTERFACE=$HOST_INTERFACE"
+      exit 1
+    fi
+    ebtables -t filter -A $CHAIN -p ARP -i $HOST_INTERFACE --arp-mac-src ! $MAC -j DROP 2>/dev/null
+    ebtables -t filter -A $CHAIN -p ARP -i $HOST_INTERFACE --arp-ip-src ! $IP -j DROP 2>/dev/null
+  done
     
 }
 
