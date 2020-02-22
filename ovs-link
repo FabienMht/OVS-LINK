@@ -88,7 +88,21 @@ get_runtime () {
      echo >&2 "$UTIL Failed to get container RUNTIME for CONTAINER=$CONTAINER"
      exit 1
    fi
+}
+
+get_bridge_type () {
+  local $BRIDGE="$1"
   
+  BRIDGE_NAME=`ip -d link show $BRIDGE | awk 'NR==3 && $0~/^[ ]*bridge/ {print $1}'`
+  
+  if [ -n "$BRIDGE_NAME" ]; then
+    TYPE="bridge"
+  elif ovs_vsctl br-exists "$BRIDGE" || \
+      ovs_vsctl add-br "$BRIDGE"; then TYPE="ovs"; else
+      echo >&2 "$UTIL: Failed to create bridge $BRIDGE"
+      exit 1
+  fi
+  echo "$TYPE"
 }
 
 get_pid () {
@@ -148,6 +162,21 @@ get_ip_address () {
   fi
   
   echo $IP  
+}
+
+delete_openflow_rules () {
+  local PORT="$1"
+  local BRIDGE="$2"
+  local ARPGUARD="$3"
+  local IPGUARD="$4"
+  
+  if [ "$ARPGUARD" = "0" -a "$IPGUARD" = "1" ]; then
+    ovs-ofctl del-flows $BRIDGE "ip,in_port=${PORT}" 2>/dev/null
+  else
+    ovs-ofctl del-flows $BRIDGE "in_port=${PORT}"  2>/dev/null
+    ovs-ofctl del-flows $BRIDGE "ip,in_port=${PORT}"  2>/dev/null
+  fi
+
 }
 
 delete_ebtables_rules () {
@@ -418,25 +447,31 @@ set_arp_guard () {
   local CONTAINER="$2"
   local INTERFACE="$3"
   local HOST_INTERFACE="$4"
-  
-  
-  if check_ebtables_rules "$HOST_INTERFACE" "1" "0";then :; else
-    echo ok
-    exit 1
-  fi
+  local BRIDGE_TYPE="$5"
+  local BRIDGE="$6"
   
   MAC=`get_mac_address $RUNTIME $CONTAINER $INTERFACE`
   IP=`get_ip_address $RUNTIME $CONTAINER $INTERFACE`
   
-  for CHAIN in "INPUT" "FORWARD"; do
-    if ebtables -t filter -A $CHAIN -s ! $MAC -i $HOST_INTERFACE -j DROP 2>/dev/null;then :;else
-      echo >&2 "$UTIL: Failed to set ARPGUARD to INTERFACE=$HOST_INTERFACE"
+  if [ "$BRIDGE_TYPE" = "ovs" ]; then
+    ovs-ofctl add-flow $BRIDGE "table=0,in_port=$HOST_INTERFACE,dl_src=$MAC,priority=5,action=resubmit(,1)"
+    ovs-ofctl add-flow $BRIDGE "table=1,in_port=$HOST_INTERFACE,arp,arp_sha=$MAC,nw_src=$IP,priority=5,action=normal"
+    ovs-ofctl add-flow $BRIDGE "table=1,in_port=*,priority=0,action=drop"
+  else
+    if check_ebtables_rules "$HOST_INTERFACE" "1" "0";then :; else
+      echo ok
       exit 1
     fi
-    ebtables -t filter -A $CHAIN -p ARP -i $HOST_INTERFACE --arp-mac-src ! $MAC -j DROP 2>/dev/null
-    ebtables -t filter -A $CHAIN -p ARP -i $HOST_INTERFACE --arp-ip-src ! $IP -j DROP 2>/dev/null
-  done
     
+    for CHAIN in "INPUT" "FORWARD"; do
+      if ebtables -t filter -A $CHAIN -s ! $MAC -i $HOST_INTERFACE -j DROP 2>/dev/null;then :;else
+        echo >&2 "$UTIL: Failed to set ARPGUARD to INTERFACE=$HOST_INTERFACE"
+        exit 1
+      fi
+      ebtables -t filter -A $CHAIN -p ARP -i $HOST_INTERFACE --arp-mac-src ! $MAC -j DROP 2>/dev/null
+      ebtables -t filter -A $CHAIN -p ARP -i $HOST_INTERFACE --arp-ip-src ! $IP -j DROP 2>/dev/null
+    done
+  fi
 }
 
 set_ip_guard () {
@@ -444,22 +479,31 @@ set_ip_guard () {
   local CONTAINER="$2"
   local INTERFACE="$3"
   local HOST_INTERFACE="$4"
+  local BRIDGE_TYPE="$5"
+  local BRIDGE="$6"
   
-  if check_ebtables_rules "$HOST_INTERFACE" "0" "1";then :; else
-    exit 1
-  fi
-  
-  MAC=`get_mac_address $RUNTIME $CONTAINER $INTERFACE`
   IP=`get_ip_address $RUNTIME $CONTAINER $INTERFACE`
   
-  if ebtables -t filter -A INPUT -p IPv4 -s $MAC -i $HOST_INTERFACE --ip-src 0.0.0.0 \
-  --ip-dst 255.255.255.255 --ip-proto udp --ip-dport 67 -j ACCEPT 2>/dev/null;then :;else
-    echo >&2 "$UTIL: Failed to set IPPGUARD to INTERFACE=$HOST_INTERFACE"
-    exit 1
-  fi
-  ebtables -t filter -A INPUT -p IPv4 -i $HOST_INTERFACE --ip-src ! $IP -j DROP 2>/dev/null
-  ebtables -t filter -A FORWARD -p IPv4 -i $HOST_INTERFACE --ip-src ! $IP -j DROP 2>/dev/null
+  if [ "$BRIDGE_TYPE" = "ovs" ]; then
+    if set_arp_guard "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$HOST_INTERFACE" "$BRIDGE_TYPE" "$BRIDGE"; then :; else
+        exit 1
+    fi
+    ovs-ofctl add-flow $BRIDGE "table=1,in_port=$HOST_INTERFACE,ip,nw_src=$IP,priority=4,action=normal"
+  else
+    if check_ebtables_rules "$HOST_INTERFACE" "0" "1";then :; else
+      exit 1
+    fi
     
+    MAC=`get_mac_address $RUNTIME $CONTAINER $INTERFACE`
+    
+    if ebtables -t filter -A INPUT -p IPv4 -s $MAC -i $HOST_INTERFACE --ip-src 0.0.0.0 \
+    --ip-dst 255.255.255.255 --ip-proto udp --ip-dport 67 -j ACCEPT 2>/dev/null;then :;else
+      echo >&2 "$UTIL: Failed to set IPPGUARD to INTERFACE=$HOST_INTERFACE"
+      exit 1
+    fi
+    ebtables -t filter -A INPUT -p IPv4 -i $HOST_INTERFACE --ip-src ! $IP -j DROP 2>/dev/null
+    ebtables -t filter -A FORWARD -p IPv4 -i $HOST_INTERFACE --ip-src ! $IP -j DROP 2>/dev/null
+  fi
 }
 
 add_port () {
@@ -536,9 +580,7 @@ add_port () {
         exit 1
     fi
 
-    if ovs_vsctl br-exists "$BRIDGE" || \
-        ovs_vsctl add-br "$BRIDGE"; then :; else
-        echo >&2 "$UTIL: Failed to create bridge $BRIDGE"
+    if BRIDGE_TYPE=`get_bridge_type "$BRIDGE"`; then :; else
         exit 1
     fi
     
@@ -619,9 +661,11 @@ add_port () {
     fi
     
     if [ -n "$ARPGUARD" -o -n "$IPGUARD" ]; then
-      if search_path ebtables > /dev/null; then :; else
-        echo >&2 "$UTIL: ebtables not found in \$PATH, please install and try again"
-        exit 1
+      if [ "$BRIDGE_TYPE" = "bridge" ]; then
+        if search_path ebtables > /dev/null; then :; else
+          echo >&2 "$UTIL: ebtables not found in \$PATH, please install and try again"
+          exit 1
+        fi
       fi
     fi
     
@@ -662,19 +706,25 @@ add_port () {
     fi
     
     if [ -n "$LIMITIN" ]; then
-      if set_bandwith_limit_interface "$HOST_INTERFACE" "$LIMITIN"; then :; else
-          exit 1
+      if [ "$BRIDGE_TYPE" = "ovs" ]; then
+        if set_bandwith_limit_interface "$HOST_INTERFACE" "$LIMITIN"; then :; else
+            exit 1
+        fi
+      else
+        echo >&2 "$UTIL limitin: feature only available for ovs type bridge"
       fi
     fi
 
     if [ -n "$ARPGUARD" ]; then
-      if set_arp_guard "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$HOST_INTERFACE"; then :; else
-          exit 1
+      if [ "$BRIDGE_TYPE" = "bridge" ] || [ "$BRIDGE_TYPE" = "ovs" -a -z "$IPGUARD" ]; then
+        if set_arp_guard "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$HOST_INTERFACE" "$BRIDGE_TYPE" "$BRIDGE"; then :; else
+            exit 1
+        fi
       fi
     fi
 
     if [ -n "$IPGUARD" ]; then
-      if set_ip_guard "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$HOST_INTERFACE"; then :; else
+      if set_ip_guard "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$HOST_INTERFACE" "$BRIDGE_TYPE" "$BRIDGE"; then :; else
           exit 1
       fi
     fi
@@ -757,7 +807,12 @@ set_port () {
         exit 1
     fi
     
+    if BRIDGE_TYPE=`get_bridge_type "$BRIDGE"`; then :; else
+        exit 1
+    fi
+    
     HOST_INTERFACE="$PORT"
+    PORT_OPENFLOW_ID=`ovs-vsctl get interface $PORT ofport`
     
     if [ "$RUNTIME" = "runc" -o "$RUNTIME" = "singularity" -o "$RUNTIME" = "lxc" ]; then
       
@@ -782,9 +837,11 @@ set_port () {
     fi
     
     if [ -n "$ARPGUARD" -o -n "$IPGUARD" ]; then
-      if search_path ebtables > /dev/null; then :; else
-        echo >&2 "$UTIL: ebtables not found in \$PATH, please install and try again"
-        exit 1
+      if [ "$BRIDGE_TYPE" = "bridge" ]; then
+        if search_path ebtables > /dev/null; then :; else
+          echo >&2 "$UTIL: ebtables not found in \$PATH, please install and try again"
+          exit 1
+        fi
       fi
     fi
     
@@ -826,34 +883,53 @@ set_port () {
     fi
     
     if [ -n "$LIMITIN" ]; then
-      if set_bandwith_limit_interface "$HOST_INTERFACE" "$LIMITIN"; then :; else
-          exit 1
+      if [ "$BRIDGE_TYPE" = "ovs" ]; then
+        if set_bandwith_limit_interface "$HOST_INTERFACE" "$LIMITIN"; then :; else
+            exit 1
+        fi
+      else
+        echo >&2 "$UTIL LIMITIN: feature only available for ovs type bridge"
       fi
     fi
 
     if [ -n "$ARPGUARD" ]; then
       if [ "$ARPGUARD" = "yes" ]; then
-        if set_arp_guard "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$HOST_INTERFACE"; then :; else
-            exit 1
+        if [ "$BRIDGE_TYPE" = "bridge" ] || [ "$BRIDGE_TYPE" = "ovs" -a -z "$IPGUARD" ]; then
+          if set_arp_guard "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$HOST_INTERFACE" "$BRIDGE_TYPE" "$BRIDGE"; then :; else
+              exit 1
+          fi
         fi
       else
-        delete_ebtables_rules "$PORT" "1" "0"
+        if [ "$BRIDGE_TYPE" = "ovs" ]; then
+          delete_openflow_rules "$PORT_OPENFLOW_ID" "$BRIDGE" "1" "1"
+          IPGUARD=""
+        else
+          delete_ebtables_rules "$PORT" "1" "0"
+        fi
       fi
     fi
 
     if [ -n "$IPGUARD" ]; then
       if [ "$IPGUARD" = "yes" ]; then
-        if set_ip_guard "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$HOST_INTERFACE"; then :; else
+        if set_ip_guard "$RUNTIME" "$CONTAINER_ID" "$INTERFACE" "$HOST_INTERFACE" "$BRIDGE_TYPE" "$BRIDGE"; then :; else
             exit 1
         fi
       else
-        delete_ebtables_rules "$PORT" "0" "1"
+        if [ "$BRIDGE_TYPE" = "ovs" ]; then
+          delete_openflow_rules "$PORT_OPENFLOW_ID" "$BRIDGE" "0" "1"
+        else
+          delete_ebtables_rules "$PORT" "0" "1"
+        fi
       fi
     fi
     
     if [ -n "$VLAN" ]; then
-      if set_vlan "$HOST_INTERFACE" "$VLAN"; then :; else
-          exit 1
+      if [ "$BRIDGE_TYPE" = "ovs" ]; then
+        if set_vlan "$HOST_INTERFACE" "$VLAN"; then :; else
+            exit 1
+        fi
+      else
+        echo >&2 "$UTIL VLAN: feature only available for ovs type bridge"
       fi
     fi
     
@@ -882,7 +958,13 @@ del_port () {
     if [ -z "$PORT" ]; then
         exit 1
     fi
+    
+    if BRIDGE_TYPE=`get_bridge_type "$BRIDGE"`; then :; else
+        exit 1
+    fi
 
+    PORT_OPENFLOW_ID=`ovs-vsctl get interface $PORT ofport`
+    
     ovs_vsctl --if-exists del-port "$PORT"
     
     clean_dhclient "$RUNTIME" "$CONTAINER" "$INTERFACE" "$USER"
@@ -893,8 +975,11 @@ del_port () {
       ip link set nomaster dev "$PORT"
     fi
     
-    delete_ebtables_rules "$PORT" "1" "1"
-    
+    if [ "$BRIDGE_TYPE" = "ovs" ]; then
+      delete_openflow_rules "$PORT_OPENFLOW_ID" "$BRIDGE" "1" "1"
+    else
+      delete_ebtables_rules "$PORT" "1" "1"
+    fi
 }
 
 del_ports () {
@@ -921,6 +1006,12 @@ del_ports () {
         exit 0
     fi
     
+    if BRIDGE_TYPE=`get_bridge_type "$BRIDGE"`; then :; else
+        exit 1
+    fi
+    
+    PORT_OPENFLOW_ID=`ovs-vsctl get interface $PORT ofport`
+    
     for PORT in $PORTS; do
         ovs_vsctl --if-exists del-port "$PORT"
         
@@ -932,8 +1023,11 @@ del_ports () {
           ip link set nomaster dev "$PORT"
         fi
         
-        delete_ebtables_rules "$PORT" "1" "1"
-        
+        if [ "$BRIDGE_TYPE" = "ovs" ]; then
+          delete_openflow_rules "$PORT" "$BRIDGE" "1" "1"
+        else
+          delete_ebtables_rules "$PORT" "1" "1"
+        fi
     done
 }
 
@@ -950,6 +1044,10 @@ flush () {
     exit 1
   fi
   
+  if BRIDGE_TYPE=`get_bridge_type "$BRIDGE"`; then :; else
+      exit 1
+  fi
+  
   for PORT in `ovs_vsctl --columns=ports --format=table --data=bare --no-headings list bridge $BRIDGE`
   do
     for NAME in `ovs_vsctl --columns=_uuid,name --format=csv --data=bare --no-headings list port`
@@ -962,9 +1060,15 @@ flush () {
         
         if ovs_vsctl --columns=error --format=csv --data=bare --no-headings list interface $PORT_NAME | \
         grep "No such device" > /dev/null; then
+          PORT_OPENFLOW_ID=`ovs-vsctl get interface $PORT_NAME ofport`
+          
           ovs_vsctl del-port $BRIDGE $PORT_NAME
           
-          delete_ebtables_rules "$PORT_NAME" "1" "1"
+          if [ "$BRIDGE_TYPE" = "ovs" ]; then
+            delete_openflow_rules "$PORT_OPENFLOW_ID" "$BRIDGE" "1" "1"
+          else
+            delete_ebtables_rules "$PORT_NAME" "1" "1"
+          fi
         fi
       fi
     done  
