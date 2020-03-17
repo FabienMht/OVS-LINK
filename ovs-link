@@ -455,7 +455,7 @@ set_arp_guard () {
   
   if [ "$BRIDGE_TYPE" = "ovs" ]; then
     ovs-ofctl add-flow $BRIDGE "table=0,in_port=$HOST_INTERFACE,dl_src=$MAC,priority=5,action=resubmit(,1)"
-    ovs-ofctl add-flow $BRIDGE "table=1,in_port=$HOST_INTERFACE,arp,arp_sha=$MAC,nw_src=$IP,priority=5,action=normal"
+    ovs-ofctl add-flow $BRIDGE "table=1,in_port=$HOST_INTERFACE,arp,arp_sha=$MAC,arp_sta=$IP,priority=5,action=normal"
     ovs-ofctl add-flow $BRIDGE "table=1,in_port=*,priority=0,action=drop"
   else
     if check_ebtables_rules "$HOST_INTERFACE" "1" "0";then :; else
@@ -732,8 +732,9 @@ add_port () {
 }
 
 set_port () {
-    INTERFACE="$1"
-    CONTAINER_NAME="$2"
+    BRIDGE="$1"
+    INTERFACE="$2"
+    CONTAINER_NAME="$3"
     USER="root"
 
     if [ -z "$INTERFACE" ] || [ -z "$CONTAINER_NAME" ]; then
@@ -741,7 +742,7 @@ set_port () {
         exit 1
     fi
 
-    shift 2
+    shift 3
     while [ $# -ne 0 ]; do
         case $1 in
             --user=*)
