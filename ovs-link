@@ -256,10 +256,7 @@ set_gateway () {
   local GATEWAY="$4"
   
   if [ "$RUNTIME" = "kata-runtime" ]; then
-    if docker exec $CONTAINER ip route delete default > /dev/null 2>&1; then :; else
-        echo >&2 "$UTIL: Failed to delete the default route in the container"
-        exit 1
-    fi
+    docker exec $CONTAINER ip route delete default > /dev/null 2>&1
     if docker exec $CONTAINER ip route add default via "$GATEWAY" > /dev/null 2>&1; then :; else
         echo >&2 "$UTIL: Failed to set the GATEWAY in the container"
         exit 1
